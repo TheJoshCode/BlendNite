@@ -6,7 +6,7 @@ https://github.com/user-attachments/assets/44e3c458-ce4c-4e78-a90a-bd802e6aa2c3
 
 # How Install?
 
-- Download the zip:
+- Download the zip: https://github.com/TheJoshCode/BlendNite/releases/download/W/BlendNite.zip
 - Drag n Drop it into Blender, click okay.
 
 # Where is panel?
