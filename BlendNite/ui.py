@@ -1,5 +1,5 @@
 import bpy
-from bpy.props import BoolProperty, FloatProperty, IntProperty
+from bpy.props import BoolProperty, FloatProperty, IntProperty, EnumProperty
 
 from . import state
 
@@ -32,6 +32,17 @@ class BlendNiteProps(bpy.types.PropertyGroup):
         name="Max Drawn Verts", default=6_000_000, min=10_000, soft_max=100_000_000,
         description="Vertex budget per frame. When the scene would exceed it, distant "
                     "objects are pushed to coarser LODs until it fits")
+    view_mode: EnumProperty(
+        name="View Mode",
+        items=[
+            ('SHADED', "Shaded", "Standard material and texture shading"),
+            ('CLAY', "Clay", "Uniform clay material shading"),
+            ('CLUSTERS', "Clusters", "Color-coded cluster visualization"),
+            ('VERTEXES', "Vertexes", "Wireframe and vertex view"),
+        ],
+        default='SHADED',
+        description="Viewport rendering mode"
+    )
 
 
 class BLENDNITE_PT_main(bpy.types.Panel):
@@ -50,6 +61,11 @@ class BLENDNITE_PT_main(bpy.types.Panel):
         col.prop(p, "precision_px")
         col.prop(p, "max_cluster_verts")
         col.prop(p, "max_drawn_verts")
+
+        l.separator()
+        row = l.row(align=True)
+        row.prop(p, "view_mode", expand=True)
+        l.separator()
 
         if not p.enabled:
             return

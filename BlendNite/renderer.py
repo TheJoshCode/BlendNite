@@ -43,6 +43,22 @@ void main() {
 }
 """
 
+def _hsv_to_rgb(h, s, v):
+    if s == 0.0:
+        return (v, v, v, 1.0)
+    i = int(h * 6.0)
+    f = (h * 6.0) - i
+    p = v * (1.0 - s)
+    q = v * (1.0 - s * f)
+    t = v * (1.0 - s * (1.0 - f))
+    i = i % 6
+    if i == 0: r, g, b = v, t, p
+    elif i == 1: r, g, b = q, v, p
+    elif i == 2: r, g, b = p, v, t
+    elif i == 3: r, g, b = p, q, v
+    elif i == 4: r, g, b = t, p, v
+    else: r, g, b = v, p, q
+    return (r, g, b, 1.0)
 
 def _make_shader():
     iface = gpu.types.GPUStageInterfaceInfo("blendnite_iface")
@@ -69,8 +85,23 @@ class _Group:
 
 
 class _GLevel:
-    __slots__ = ("vbo", "groups")
+    __slots__ = ("vbo", "groups", "cluster_batches")
 
+def _cluster_batch(self, asset, li, g, lvl):
+        if getattr(g, "cluster_batches", None) is None:
+            cs = lvl.cluster_start
+            n_c = len(cs) - 1
+            c_batches = []
+            for c in range(n_c):
+                t0, t1 = int(cs[c]), int(cs[c + 1])
+                ibo = gpu.types.GPUIndexBuf(
+                    type="TRIS", seq=np.ascontiguousarray(lvl.tris[t0:t1], np.int32))
+                batch = gpu.types.GPUBatch(type="TRIS", buf=g.vbo, elem=ibo)
+                hue = (c * 0.618033988749895) % 1.0
+                col = _hsv_to_rgb(hue, 0.7, 0.9)
+                c_batches.append((batch, col, t1 - t0))
+            g.cluster_batches = c_batches
+        return g.cluster_batches
 
 class Renderer:
     def __init__(self, sync):
@@ -321,43 +352,70 @@ class Renderer:
         backface = bool(getattr(sd.shading, "show_backface_culling", False))
         use_cull = True
         drawn = tris = verts = 0
-        for i in np.nonzero(vis)[0]:
-            inst = self.insts[i]
-            li = int(self.lev[i])
-            lvl = inst.asset.levels[li]
-            g = self._gpu_level(inst.asset, li)
-            parts = None
-            if use_cull and lvl.n_tris >= CULL_MIN_TRIS:
-                parts = self._cull(inst, li, lvl, g, PV, planes, cam, fwd, persp, backface)
 
-            M = inst.matrix
-            VM = V @ M
-            nm = np.eye(4)
-            nm[:3, :3] = np.linalg.inv(VM[:3, :3]).T
-            shader.uniform_float("mvp", Matrix((PV @ M).tolist()))
-            shader.uniform_float("normalMat", Matrix(nm.tolist()))
+        view_mode = p.view_mode
+        if view_mode == 'VERTEXES':
+            gpu.state.polygon_mode_set('LINE')
 
-            any_drawn = False
-            for gi, gr in enumerate(g.groups):
-                batch, nt = gr.batch, gr.t1 - gr.t0
-                if parts is not None:
-                    b, nt = parts[gi]
-                    if b is False:
-                        continue
-                    if b is not None:
-                        batch = b
-                mats = inst.mats
-                color, image = (mats[min(gr.slot, len(mats) - 1)] if mats else DEFAULT_MATERIAL)
-                tex = self._texture(image)
-                shader.uniform_float("color", color)
-                shader.uniform_int("useTex", 1 if tex is not None else 0)
-                shader.uniform_sampler("diffuseTex", tex if tex is not None else white)
-                batch.draw(shader)
-                tris += nt
-                any_drawn = True
-            if any_drawn:
-                drawn += 1
-                verts += lvl.n_verts
+        try:
+            for i in np.nonzero(vis)[0]:
+                inst = self.insts[i]
+                li = int(self.lev[i])
+                lvl = inst.asset.levels[li]
+                g = self._gpu_level(inst.asset, li)
+
+                M = inst.matrix
+                VM = V @ M
+                nm = np.eye(4)
+                nm[:3, :3] = np.linalg.inv(VM[:3, :3]).T
+                shader.uniform_float("mvp", Matrix((PV @ M).tolist()))
+                shader.uniform_float("normalMat", Matrix(nm.tolist()))
+
+                if view_mode == 'CLUSTERS':
+                    c_batches = self._cluster_batch(inst.asset, li, g, lvl)
+                    for batch, col, nt in c_batches:
+                        shader.uniform_float("color", col)
+                        shader.uniform_int("useTex", 0)
+                        shader.uniform_sampler("diffuseTex", white)
+                        batch.draw(shader)
+                        tris += nt
+                    drawn += 1
+                    verts += lvl.n_verts
+                else:
+                    parts = None
+                    if use_cull and lvl.n_tris >= CULL_MIN_TRIS:
+                        parts = self._cull(inst, li, lvl, g, PV, planes, cam, fwd, persp, backface)
+
+                    any_drawn = False
+                    for gi, gr in enumerate(g.groups):
+                        batch, nt = gr.batch, gr.t1 - gr.t0
+                        if parts is not None:
+                            b, nt = parts[gi]
+                            if b is False:
+                                continue
+                            if b is not None:
+                                batch = b
+
+                        if view_mode == 'CLAY':
+                            color = (0.82, 0.55, 0.38, 1.0)
+                            tex = None
+                        else:
+                            mats = inst.mats
+                            color, image = (mats[min(gr.slot, len(mats) - 1)] if mats else DEFAULT_MATERIAL)
+                            tex = self._texture(image) if view_mode == 'SHADED' else None
+
+                        shader.uniform_float("color", color)
+                        shader.uniform_int("useTex", 1 if (tex is not None and view_mode == 'SHADED') else 0)
+                        shader.uniform_sampler("diffuseTex", tex if (tex is not None and view_mode == 'SHADED') else white)
+                        batch.draw(shader)
+                        tris += nt
+                        any_drawn = True
+                    if any_drawn:
+                        drawn += 1
+                        verts += lvl.n_verts
+        finally:
+            if view_mode == 'VERTEXES':
+                gpu.state.polygon_mode_set('FILL')
 
         gpu.state.depth_mask_set(False)
         gpu.state.depth_test_set("NONE")
