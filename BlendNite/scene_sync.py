@@ -28,7 +28,6 @@ import numpy as np
 from . import clustering
 
 MARK = "_blendnite_orig_display"
-MIN_POLYS = 2000            # smaller meshes are cheaper to leave to Blender
 MAX_LEVELS = 8
 IDLE_EVICT_S = 120.0
 WORKERS = min(4, max(1, (os.cpu_count() or 2) // 2))
@@ -47,7 +46,7 @@ def default_cache_dir() -> str:
 
 
 class Settings:
-    __slots__ = ("precision_px", "max_verts", "max_drawn", "cache_dir")
+    __slots__ = ("precision_px", "max_verts", "max_drawn", "min_verts", "cache_dir")
 
     @classmethod
     def from_scene(cls, scene):
@@ -56,6 +55,7 @@ class Settings:
         s.precision_px = float(p.precision_px)
         s.max_verts = int(p.max_cluster_verts)
         s.max_drawn = int(p.max_drawn_verts)
+        s.min_verts = int(p.min_verts)
         s.cache_dir = default_cache_dir()
         return s
 
@@ -503,14 +503,14 @@ class SceneSync:
 
     # ── scene scan ────────────────────────────────────────────────────────
     @staticmethod
-    def _eligible(obj) -> bool:
+    def _eligible(obj, min_verts) -> bool:
         if obj.type != "MESH" or obj.mode != "OBJECT" or not obj.visible_get():
             return False
         if not (obj.display_type in ("TEXTURED", "SOLID")
                 or (MARK in obj and obj.display_type == "BOUNDS")):
             return False
         mesh = obj.data
-        if mesh is None or len(mesh.polygons) < MIN_POLYS or mesh.shape_keys:
+        if mesh is None or len(mesh.vertices) < min_verts or len(mesh.polygons) == 0 or mesh.shape_keys:
             return False
         for m in obj.modifiers:             # evaluated meshes are not clustered
             if m.show_viewport:
@@ -540,7 +540,7 @@ class SceneSync:
         for obj in scene.objects:
             if obj.type != "MESH":
                 continue
-            if self.suspended or not self._eligible(obj):
+            if self.suspended or not self._eligible(obj, st.min_verts):
                 release_native(obj)
                 continue
             mesh = obj.data

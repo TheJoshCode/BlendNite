@@ -28,6 +28,10 @@ class BlendNiteProps(bpy.types.PropertyGroup):
         name="Precision (px)", default=10.0, min=0.5, max=64.0, step=50, precision=1,
         description="Maximum on-screen geometric error in pixels. Lower = more detail, "
                     "higher = coarser LODs sooner")
+    min_verts: IntProperty(
+        name="Min Verts", default=2000, min=0, soft_max=1_000_000, update=_on_build_change,
+        description="Meshes with fewer vertices than this are left to Blender's native drawing "
+                    "and are not clustered")
     max_cluster_verts: IntProperty(
         name="Max Verts / Cluster", default=128, min=16, max=1024, update=_on_build_change,
         description="Hard upper bound of unique vertices in one cluster "
@@ -67,6 +71,7 @@ class BLENDNITE_PT_main(bpy.types.Panel):
 
         col = l.column(align=True)
         col.prop(p, "precision_px")
+        col.prop(p, "min_verts")
         col.prop(p, "max_cluster_verts")
         col.prop(p, "max_drawn_verts")
 
