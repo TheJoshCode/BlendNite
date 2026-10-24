@@ -29,6 +29,26 @@ from . import clustering
 MARK = "_gpuc_orig_display"
 
 
+def _extract_uvs(mesh) -> np.ndarray:
+    """Return per-vertex UVs from the active UV layer, averaged from loop data.
+    Returns (N, 2) float32 array or None if no UV layer exists."""
+    if not mesh.uv_layers:
+        return None
+    uv_layer = mesh.uv_layers[0].data
+    loops = mesh.loops
+    nv = len(mesh.vertices)
+    uv = np.zeros(nv * 2, np.float32)
+    count = np.zeros(nv, np.float32)
+    for i in range(len(loops)):
+        vi = loops[i].vertex_index
+        uv[vi * 2] += uv_layer[i].uv[0]
+        uv[vi * 2 + 1] += uv_layer[i].uv[1]
+        count[vi] += 1.0
+    ok = count > 0
+    uv[ok] /= count[ok][:, None]
+    return uv.reshape(-1, 2)
+
+
 def default_cache_dir() -> str:
     return os.path.join(bpy.utils.user_resource("CONFIG", create=True), "gpu_cluster_cache")
 
@@ -72,8 +92,8 @@ class Instance:
 
 # ── worker jobs (numpy only, never touch bpy) ─────────────────────────────
 
-def _job_build(key, positions, tris, cluster_size, levels, path):
-    asset = clustering.build_asset(positions, tris, cluster_size, levels, key)
+def _job_build(key, positions, tris, cluster_size, levels, path, uvs):
+    asset = clustering.build_asset(positions, tris, cluster_size, levels, key, uvs)
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         clustering.save_asset(asset, path)
@@ -294,9 +314,10 @@ class SceneSync:
         mesh.vertices.foreach_get("co", co)
         tris = np.empty(nt * 3, np.int32)
         mesh.loop_triangles.foreach_get("vertices", tris)
+        uvs = _extract_uvs(mesh)
         self.futures[key] = pool.submit(_job_build, key, co.reshape(-1, 3),
                                         tris.reshape(-1, 3), st.cluster_size,
-                                        st.lod_levels, path)
+                                        st.lod_levels, path, uvs)
 
     # ── scene scan ────────────────────────────────────────────────────────
     @staticmethod

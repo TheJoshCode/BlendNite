@@ -21,9 +21,9 @@ import os
 
 import numpy as np
 
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 _FIELDS = ("positions", "normals", "tris", "cluster_start",
-           "centers", "radii", "cone_axis", "cone_cutoff")
+           "centers", "radii", "cone_axis", "cone_cutoff", "uvs")
 
 
 class LODLevel:
@@ -101,9 +101,12 @@ def vertex_normals(pos: np.ndarray, tris: np.ndarray) -> np.ndarray:
     return (n / ln[:, None]).astype(np.float32)
 
 
-def simplify_grid(pos: np.ndarray, tris: np.ndarray, cell: float):
+def simplify_grid(pos: np.ndarray, tris: np.ndarray, uvs: np.ndarray, cell: float):
     """Vertex clustering: snap vertices to a grid, average per cell, drop collapsed
-    and duplicate triangles.  O(N), fully vectorised."""
+    and duplicate triangles.  O(N), fully vectorised.
+
+    Returns (new_positions, new_uvs, new_tris) or (None, None, None) if collapsed.
+    """
     p = pos.astype(np.float64)
     q = np.floor((p - p.min(axis=0)) / cell).astype(np.int64)
     dims = q.max(axis=0) + 1
@@ -113,11 +116,18 @@ def simplify_grid(pos: np.ndarray, tris: np.ndarray, cell: float):
     cnt = np.bincount(inv).astype(np.float64)
     newpos = np.stack([np.bincount(inv, weights=p[:, c]) / cnt for c in range(3)], axis=1)
 
+    # Average UVs per cluster cell (same inv mapping)
+    nu = uvs.shape[1] if uvs.ndim > 1 else 1
+    if nu == 2:
+        newuvs = np.stack([np.bincount(inv, weights=uvs[:, c]) / cnt for c in range(2)], axis=1)
+    else:
+        newuvs = np.bincount(inv, weights=uvs[:, 0]) / cnt[:, None]
+
     nt = inv[tris]
     ok = (nt[:, 0] != nt[:, 1]) & (nt[:, 1] != nt[:, 2]) & (nt[:, 0] != nt[:, 2])
     nt = nt[ok]
     if len(nt) == 0:
-        return None, None
+        return None, None, None
 
     nv = len(newpos)
     s = np.sort(nt, axis=1).astype(np.int64)
@@ -130,16 +140,19 @@ def simplify_grid(pos: np.ndarray, tris: np.ndarray, cell: float):
 
     used, inv2 = np.unique(nt.reshape(-1), return_inverse=True)
     return (newpos[used].astype(np.float32),
+            newuvs[used].astype(np.float32),
             inv2.reshape(-1, 3).astype(np.int32))
 
 
-def _make_level(pos, tris, cluster_size, error) -> LODLevel:
+def _make_level(pos, tris, uvs, cluster_size, error) -> LODLevel:
     pos = np.ascontiguousarray(pos, np.float32)
     tris = np.ascontiguousarray(tris, np.int32)
+    uvs = np.ascontiguousarray(uvs, np.float32)
     tp = pos[tris]                                   # (T,3,3)
     order = morton_order(tp.mean(axis=1))
     tris = np.ascontiguousarray(tris[order])
     tp = tp[order]
+    uvs = uvs[order]
     T = len(tris)
 
     starts = np.arange(0, T, cluster_size, dtype=np.int64)
@@ -160,17 +173,21 @@ def _make_level(pos, tris, cluster_size, error) -> LODLevel:
     cutoff = np.where(mindot >= 0.1, np.sqrt(np.clip(1.0 - mindot ** 2, 0.0, 1.0)), 1.0)
 
     return LODLevel(
-        positions=pos, normals=vertex_normals(pos, tris), tris=tris,
+        positions=pos, normals=vertex_normals(pos, tris), tris=tris, uvs=uvs,
         cluster_start=cstart, centers=centers.astype(np.float32),
         radii=radii.astype(np.float32), cone_axis=axis.astype(np.float32),
         cone_cutoff=cutoff.astype(np.float32), error=float(error))
 
 
-def build_asset(positions, tris, cluster_size=128, max_levels=6, key="") -> ClusterAsset:
+def build_asset(positions, tris, cluster_size=128, max_levels=6, key="", uvs=None) -> ClusterAsset:
     pos = np.ascontiguousarray(positions, np.float32).reshape(-1, 3)
     tris = np.ascontiguousarray(tris, np.int32).reshape(-1, 3)
     if len(tris) == 0:
         raise ValueError("mesh has no triangles")
+    if uvs is not None:
+        uvs = np.ascontiguousarray(uvs, np.float32).reshape(-1, 2)
+    else:
+        uvs = np.zeros(len(pos), np.float32)
 
     bmin, bmax = pos.min(axis=0), pos.max(axis=0)
     extent = max(float((bmax - bmin).max()), 1e-9)
@@ -185,12 +202,12 @@ def build_asset(positions, tris, cluster_size=128, max_levels=6, key="") -> Clus
         if res < 3.0 or prev_T <= cluster_size:
             break
         cell = extent / res
-        p2, t2 = simplify_grid(pos, tris, cell)
+        p2, u2, t2 = simplify_grid(pos, tris, uvs, cell)
         if t2 is None:
             break
         if len(t2) > prev_T * 0.8:      # barely reduced: jump to a coarser grid
             continue
-        levels.append(_make_level(p2, t2, cluster_size, cell * 0.866))
+        levels.append(_make_level(p2, t2, u2, cluster_size, cell * 0.866))
         prev_T = len(t2)
     return ClusterAsset(key, levels, center, radius, cluster_size)
 

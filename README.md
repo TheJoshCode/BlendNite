@@ -12,6 +12,7 @@ N-panel > **Cluster** tab > **Enable**.
 - **Disk cache**: one `.npz` per unique geometry in Blender's config folder, so reopening a scene skips the build.
 - **Clusters**: triangles are Morton-sorted and chunked into 128-triangle clusters. Each cluster has a bounding sphere and a normal cone.
 - **LOD**: grid vertex clustering at halving resolution gives about 4x fewer triangles per level. Each level has a known object-space error. LOD is chosen per object from projected pixel error (`Max Error (px)`), with hysteresis.
+- **Textures**: the first material slot's image is bound per-instance and sampled in the fragment shader. UVs are averaged per-vertex during grid clustering. Switch to **Textured** view in the N-panel to enable.
 - **Culling**: object-level frustum test is vectorised over all instances. Objects with 50k+ triangles also get per-cluster frustum and back-face culling.
 - **Replace native draw**: managed objects switch to Bounds display so Blender does not draw them twice. The original display type is saved on the object and restored on disable.
 

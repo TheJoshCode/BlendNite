@@ -47,6 +47,7 @@ class GPUClusterProps(bpy.types.PropertyGroup):
     debug_mode: EnumProperty(
         name="View", default="SHADED",
         items=[("SHADED", "Shaded", ""),
+               ("TEXTURED", "Textured", "Draw with material textures"),
                ("LOD", "LOD Levels", "Tint by LOD level"),
                ("CLUSTER", "Clusters", "Colour by cluster (disables cluster culling)")])
     cache_dir: StringProperty(name="Cache Folder", subtype="DIR_PATH", default="",

@@ -11,6 +11,7 @@ Per frame (all vectorised over instances):
 from __future__ import annotations
 
 import traceback
+from typing import Dict
 
 import bpy
 import gpu
@@ -21,11 +22,12 @@ CULL_MIN_TRIS = 50_000       # per-cluster culling only pays off above this
 LOD_TINTS = [(0.80, 0.80, 0.80), (0.30, 0.80, 1.00), (0.50, 1.00, 0.40),
              (1.00, 0.90, 0.20), (1.00, 0.50, 0.20), (1.00, 0.30, 0.30),
              (0.80, 0.30, 1.00), (0.50, 0.50, 1.00)]
-MODES = {"SHADED": 0, "LOD": 1, "CLUSTER": 2}
+MODES = {"SHADED": 0, "TEXTURED": 1, "LOD": 2, "CLUSTER": 3}
 
 _VERT = """
 void main() {
     vN = normalize(mat3(normalMat) * nor);
+    vUV = aUV;
     gl_Position = mvp * vec4(pos, 1.0);
 }
 """
@@ -35,14 +37,14 @@ void main() {
     vec3 n = normalize(vN);
     if (!gl_FrontFacing) n = -n;
     float l = 0.35 + 0.65 * max(dot(n, normalize(vec3(0.3, 0.5, 0.8))), 0.0);
-    vec3 c = color.rgb * l;
+    vec3 c = texture(diffuseTex, vUV).rgb * color.rgb * l;
 %s
     fragColor = vec4(c, 1.0);
 }
 """
 
 _CLUSTER_COLOR = """
-    if (mode == 2) {
+    if (mode == 3) {
         float h = fract(sin(float(gl_PrimitiveID / clusterSize) * 12.9898) * 43758.5453);
         c = (0.5 + 0.5 * cos(6.28318 * (h + vec3(0.0, 0.33, 0.67)))) * l;
     }
@@ -52,23 +54,27 @@ _CLUSTER_COLOR = """
 def _make_shader(with_cluster_debug: bool):
     iface = gpu.types.GPUStageInterfaceInfo("gpuc_iface")
     iface.smooth("VEC3", "vN")
+    iface.smooth("VEC2", "vUV")
     info = gpu.types.GPUShaderCreateInfo()
     info.push_constant("MAT4", "mvp")
     info.push_constant("MAT4", "normalMat")
     info.push_constant("VEC4", "color")
     info.push_constant("INT", "mode")
     info.push_constant("INT", "clusterSize")
+    info.vertex_input(0, "diffuseTex")
     info.vertex_in(0, "VEC3", "pos")
     info.vertex_in(1, "VEC3", "nor")
+    info.vertex_in(2, "VEC2", "aUV")
     info.vertex_out(iface)
     info.fragment_out(0, "VEC4", "fragColor")
     info.vertex_source(_VERT)
-    info.fragment_source(_FRAG % (_CLUSTER_COLOR if with_cluster_debug else ""))
+    frag = _FRAG % (_CLUSTER_COLOR if with_cluster_debug else "")
+    info.fragment_source(frag)
     return gpu.shader.create_from_info(info)
 
 
 class _GLevel:
-    __slots__ = ("vbo", "batch")
+    __slots__ = ("vbo", "ibo", "batch", "gpu_tex")
 
 
 class Renderer:
@@ -78,6 +84,7 @@ class Renderer:
         self.shader = None
         self.cluster_debug_ok = True
         self.gl = {}                       # (asset key, lod) -> _GLevel
+        self._tex_cache: Dict[str, object] = {}   # image name -> GPUTexture
         self.stats = {"drawn": 0, "tris": 0, "total_tris": 0}
         self._ver = None
         self._frame = 0
@@ -117,13 +124,17 @@ class Renderer:
         fmt = gpu.types.GPUVertFormat()
         fmt.attr_add(id="pos", comp_type="F32", len=3, fetch_mode="FLOAT")
         fmt.attr_add(id="nor", comp_type="F32", len=3, fetch_mode="FLOAT")
+        fmt.attr_add(id="aUV", comp_type="F32", len=2, fetch_mode="FLOAT")
         vbo = gpu.types.GPUVertBuf(fmt, len(lvl.positions))
         vbo.attr_fill("pos", lvl.positions)
         vbo.attr_fill("nor", lvl.normals)
+        vbo.attr_fill("aUV", lvl.uvs)
         ibo = gpu.types.GPUIndexBuf(type="TRIS", seq=lvl.tris)
         g = _GLevel()
         g.vbo = vbo
+        g.ibo = ibo
         g.batch = gpu.types.GPUBatch(type="TRIS", buf=vbo, elem=ibo)
+        g.gpu_tex = None
         self.gl[k] = g
         return g
 
@@ -178,6 +189,32 @@ class Renderer:
             res = (gpu.types.GPUBatch(type="TRIS", buf=g.vbo, elem=ibo), len(idx))
         inst.cull = (sig, res[0], res[1])
         return res
+
+    # ── texture cache ───────────────────────────────────────────────────────
+    def _get_or_create_texture(self, image_name: str):
+        tex = self._tex_cache.get(image_name)
+        if tex is not None:
+            return tex
+        img = bpy.data.images.get(image_name)
+        if img is None or not img.pixels:
+            return None
+        try:
+            tex = gpu.types.GPUTexture(image.size, data=img.pixels.as_buffer())
+        except Exception:
+            return None
+        self._tex_cache[image_name] = tex
+        return tex
+
+    def _bind_texture(self, shader, image_name: str):
+        tex = self._get_or_create_texture(image_name)
+        if tex is None:
+            return
+        try:
+            gpu.state.texture_unit_set(0)
+            tex.bind(0)
+            shader.uniform_sampler("diffuseTex", 0)
+        except Exception:
+            pass
 
     # ── draw ──────────────────────────────────────────────────────────────
     def draw(self):
@@ -238,14 +275,14 @@ class Renderer:
         shader = self._get_shader()
         shader.bind()
         mode = MODES.get(p.debug_mode, 0)
-        if mode == 2 and not self.cluster_debug_ok:
+        if mode == 3 and not self.cluster_debug_ok:
             mode = 0
         shader.uniform_int("mode", mode)
         shader.uniform_int("clusterSize", int(max(1, p.cluster_size)))
         gpu.state.depth_test_set("LESS_EQUAL")
         gpu.state.depth_mask_set(True)
 
-        use_cull = p.cluster_culling and mode != 2
+        use_cull = p.cluster_culling and mode != 3
         drawn = tris = 0
         for i in np.nonzero(vis)[0]:
             inst = self.insts[i]
@@ -263,10 +300,29 @@ class Renderer:
             VM = V @ M
             nm = np.eye(4)
             nm[:3, :3] = np.linalg.inv(VM[:3, :3]).T
-            t = LOD_TINTS[min(li, len(LOD_TINTS) - 1)] if mode == 1 else LOD_TINTS[0]
+
+            # Texture binding
+            if mode in (0, 1):
+                obj = bpy.data.objects.get(inst.name)
+                if obj and obj.data.materials:
+                    mat = obj.data.materials[0]
+                    if mat and mat.image:
+                        self._bind_texture(shader, mat.image.name)
+
+            if mode == 1:
+                # TEXTURED: use material color tint
+                obj = bpy.data.objects.get(inst.name)
+                if obj and obj.data.materials and obj.data.materials[0]:
+                    mc = obj.data.materials[0].diffuse_color
+                    tint = (mc[0], mc[1], mc[2], 1.0)
+                else:
+                    tint = (1.0, 1.0, 1.0, 1.0)
+            else:
+                tint = LOD_TINTS[min(li, len(LOD_TINTS) - 1)] if mode == 2 else LOD_TINTS[0]
+
             shader.uniform_float("mvp", Matrix((PV @ M).tolist()))
             shader.uniform_float("normalMat", Matrix(nm.tolist()))
-            shader.uniform_float("color", (t[0], t[1], t[2], 1.0))
+            shader.uniform_float("color", tint)
             batch.draw(shader)
             drawn += 1
             tris += nt
