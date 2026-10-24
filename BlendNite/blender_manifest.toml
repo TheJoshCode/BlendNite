@@ -1,0 +1,12 @@
+schema_version = "1.0.0"
+
+id = "blendnite"
+version = "1.0.0"
+name = "BlendNite"
+tagline = "Viewport Nanite Style GPU Clustering"
+maintainer = "JoshMakesStuff"
+type = "add-on"
+website = "https://github.com/"
+
+blender_version_min = "5.2.0"
+license = ["SPDX:GPL-3.0-or-later"]

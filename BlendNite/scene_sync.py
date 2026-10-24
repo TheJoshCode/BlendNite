@@ -36,6 +36,13 @@ DEFAULT_MATERIAL = ((0.8, 0.8, 0.8, 1.0), None)
 
 
 def default_cache_dir() -> str:
+    """Per-user cache folder.  Extensions (4.2+) must use extension_path_user."""
+    try:
+        base = bpy.utils.extension_path_user(__package__, path="cache", create=True)
+        if base:
+            return base
+    except Exception:
+        pass                                   # legacy add-on install: not an extension
     return os.path.join(bpy.utils.user_resource("CONFIG", create=True), "blendnite_cache")
 
 
@@ -93,7 +100,7 @@ def material_info(mat):
     color = tuple(float(c) for c in mat.diffuse_color)
     image = None
     try:
-        if mat.use_nodes and mat.node_tree:
+        if mat.node_tree:                       # Material.use_nodes is deprecated (5.0) / always True
             sock = _color_socket(mat.node_tree)
             if sock is not None:
                 if sock.is_linked:
@@ -143,6 +150,48 @@ def _get(coll, attr, dtype, count):
     return a
 
 
+def _uv_array(mesh, nl):
+    """Active UV map as (nl, 2) float32, or None.
+
+    MeshUVLoop / MeshUVLoopLayer.data are deprecated (3.5) - use the `uv` attribute
+    collection (Float2AttributeValue.vector); `.data` is only a last resort."""
+    layer = mesh.uv_layers.active
+    if layer is None:
+        return None
+    try:
+        a = np.empty(nl * 2, np.float32)
+        layer.uv.foreach_get("vector", a)
+        return a.reshape(-1, 2)
+    except Exception:
+        a = np.empty(nl * 2, np.float32)
+        layer.data.foreach_get("uv", a)
+        return a.reshape(-1, 2)
+
+
+def _poly_offsets(mesh, npoly):
+    """Face-corner start offsets (npoly + 1), or None if neither API is available."""
+    try:
+        a = np.empty(npoly + 1, np.int32)
+        mesh.polygon_offset_indices.foreach_get(a)
+        return a
+    except Exception:
+        pass
+    try:
+        return _get(mesh.polygons, "loop_total", np.int32, npoly)
+    except Exception:
+        return None
+
+
+def _face_attr(mesh, name, dtype, count, default):
+    """Per-face generic attribute (sharp_face, material_index) with a default."""
+    at = mesh.attributes.get(name)
+    if at is None or at.domain != "FACE" or len(at.data) != count:
+        return np.full(count, default, dtype)
+    a = np.empty(count, dtype)
+    at.data.foreach_get("value", a)
+    return a
+
+
 def mesh_digests(mesh):
     """(topology digest, position digest).  Topology covers connectivity, UVs, face
     smoothing and material assignment: if it is unchanged an edit is position-only."""
@@ -150,15 +199,14 @@ def mesh_digests(mesh):
     ht = hashlib.blake2b(digest_size=12)
     ht.update(np.array([nv, nl, npoly], np.int64))
     ht.update(_get(mesh.loops, "vertex_index", np.int32, nl))
-    for attr, dt in (("loop_total", np.int32), ("material_index", np.int32),
-                     ("use_smooth", np.bool_)):
-        try:
-            ht.update(_get(mesh.polygons, attr, dt, npoly))
-        except Exception:
-            pass
-    layer = mesh.uv_layers.active
-    if layer is not None:
-        ht.update(_get(layer.data, "uv", np.float32, nl * 2))
+    offs = _poly_offsets(mesh, npoly)
+    if offs is not None:
+        ht.update(offs)
+    ht.update(_face_attr(mesh, "material_index", np.int32, npoly, 0))
+    ht.update(_face_attr(mesh, "sharp_face", np.bool_, npoly, False))
+    uv = _uv_array(mesh, nl)
+    if uv is not None:
+        ht.update(uv)
     hc = hashlib.blake2b(digest_size=12)
     hc.update(_get(mesh.vertices, "co", np.float32, nv * 3))
     return ht.hexdigest(), hc.hexdigest()
@@ -169,22 +217,18 @@ def extract_mesh(mesh):
     nt = len(mesh.loop_triangles)
     if nt == 0:
         return None
-    nv, nl = len(mesh.vertices), len(mesh.loops)
+    nv, nl, npoly = len(mesh.vertices), len(mesh.loops), len(mesh.polygons)
     lt = mesh.loop_triangles
-    try:
-        ts = _get(lt, "use_smooth", np.bool_, nt)
-    except Exception:
-        ts = np.ones(nt, np.bool_)
-    uv = None
-    layer = mesh.uv_layers.active
-    if layer is not None:
-        uv = _get(layer.data, "uv", np.float32, nl * 2).reshape(-1, 2)
+    pi = _get(lt, "polygon_index", np.int32, nt)
+    sharp = _face_attr(mesh, "sharp_face", np.bool_, npoly, False)
+    mat = _face_attr(mesh, "material_index", np.int32, npoly, 0)
     return {
         "co": _get(mesh.vertices, "co", np.float32, nv * 3).reshape(-1, 3),
         "tv": _get(lt, "vertices", np.int32, nt * 3).reshape(-1, 3),
         "tl": _get(lt, "loops", np.int32, nt * 3).reshape(-1, 3),
-        "tm": _get(lt, "material_index", np.int32, nt),
-        "ts": ts, "uv": uv,
+        "tm": mat[pi],
+        "ts": ~sharp[pi],
+        "uv": _uv_array(mesh, nl),
     }
 
 
@@ -257,19 +301,20 @@ class SceneSync:
         self._last_sig = None
         self._last_mode = None
         self._pruned = False
+        self._tick_cb = self._tick           # one stable bound-method object for bpy.app.timers
 
     # ── lifecycle ─────────────────────────────────────────────────────────
     def activate(self):
         self.active = True
         self.dirty = True
         self._pruned = False
-        if not bpy.app.timers.is_registered(self._tick):
-            bpy.app.timers.register(self._tick, first_interval=0.05, persistent=True)
+        if not bpy.app.timers.is_registered(self._tick_cb):
+            bpy.app.timers.register(self._tick_cb, first_interval=0.05, persistent=True)
 
     def deactivate(self):
         self.active = False
-        if bpy.app.timers.is_registered(self._tick):
-            bpy.app.timers.unregister(self._tick)
+        if bpy.app.timers.is_registered(self._tick_cb):
+            bpy.app.timers.unregister(self._tick_cb)
         self.restore_all()
         if self._pool is not None:
             self._pool.shutdown(wait=False, cancel_futures=True)

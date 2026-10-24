@@ -33,15 +33,37 @@ void main() {
 }
 """
 
+# Blender 5.0+: textures from gpu.texture.from_image() are scene-linear, while the
+# viewport target drawn into from a Python draw handler is Rec.709 sRGB encoded, so
+# linear data must be encoded here.  `color` is already display encoded on the CPU side.
 _FRAG = """
+vec3 linear_to_srgb(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    vec3 lo = c * 12.92;
+    vec3 hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
+    return mix(hi, lo, vec3(lessThanEqual(c, vec3(0.0031308))));
+}
 void main() {
     vec3 n = normalize(vN);
     if (!gl_FrontFacing) n = -n;
     float l = 0.35 + 0.65 * max(dot(n, normalize(vec3(0.3, 0.5, 0.8))), 0.0);
-    vec3 base = (useTex != 0) ? texture(diffuseTex, vUV).rgb : color.rgb;
+    if (useTex == 2) {                       // wire: flat, unlit
+        fragColor = vec4(color.rgb, 1.0);
+        return;
+    }
+    vec3 base = (useTex == 1) ? linear_to_srgb(texture(diffuseTex, vUV).rgb) : color.rgb;
     fragColor = vec4(base * l, 1.0);
 }
 """
+
+def _srgb_encode(c):
+    """Scene-linear RGBA tuple -> display (sRGB) encoded RGBA tuple."""
+    out = []
+    for v in c[:3]:
+        v = min(max(float(v), 0.0), 1.0)
+        out.append(v * 12.92 if v <= 0.0031308 else 1.055 * v ** (1.0 / 2.4) - 0.055)
+    return (out[0], out[1], out[2], 1.0)
+
 
 def _hsv_to_rgb(h, s, v):
     if s == 0.0:
@@ -85,23 +107,14 @@ class _Group:
 
 
 class _GLevel:
-    __slots__ = ("vbo", "groups", "cluster_batches")
+    __slots__ = ("vbo", "groups", "cluster_batches", "wire")
 
-def _cluster_batch(self, asset, li, g, lvl):
-        if getattr(g, "cluster_batches", None) is None:
-            cs = lvl.cluster_start
-            n_c = len(cs) - 1
-            c_batches = []
-            for c in range(n_c):
-                t0, t1 = int(cs[c]), int(cs[c + 1])
-                ibo = gpu.types.GPUIndexBuf(
-                    type="TRIS", seq=np.ascontiguousarray(lvl.tris[t0:t1], np.int32))
-                batch = gpu.types.GPUBatch(type="TRIS", buf=g.vbo, elem=ibo)
-                hue = (c * 0.618033988749895) % 1.0
-                col = _hsv_to_rgb(hue, 0.7, 0.9)
-                c_batches.append((batch, col, t1 - t0))
-            g.cluster_batches = c_batches
-        return g.cluster_batches
+    def __init__(self):
+        self.vbo = None
+        self.groups = []
+        self.cluster_batches = None
+        self.wire = None
+
 
 class Renderer:
     def __init__(self, sync):
@@ -118,6 +131,36 @@ class Renderer:
         self._last_err = None
         self.insts = []
         self.lev = np.zeros(0, np.int64)
+
+
+    # ── cluster / wire debug batches (built lazily) ───────────────────────
+    def _cluster_batch(self, asset, li, g, lvl):
+        if g.cluster_batches is None:
+            cs = lvl.cluster_start
+            c_batches = []
+            for c in range(len(cs) - 1):
+                t0, t1 = int(cs[c]), int(cs[c + 1])
+                ibo = gpu.types.GPUIndexBuf(
+                    type="TRIS", seq=np.ascontiguousarray(lvl.tris[t0:t1], np.int32))
+                batch = gpu.types.GPUBatch(type="TRIS", buf=g.vbo, elem=ibo)
+                col = _hsv_to_rgb((c * 0.618033988749895) % 1.0, 0.7, 0.9)
+                c_batches.append((batch, col, t1 - t0))
+            g.cluster_batches = c_batches
+        return g.cluster_batches
+
+    def _wire_batch(self, g, lvl):
+        """Unique triangle edges as a LINES batch.  (gpu.state has no polygon-mode
+        switch, so wireframe has to be real line geometry.)"""
+        if g.wire is None:
+            t = lvl.tris.astype(np.int64)
+            e = np.concatenate([t[:, [0, 1]], t[:, [1, 2]], t[:, [2, 0]]])
+            e.sort(axis=1)
+            nv = int(lvl.n_verts)
+            key = np.unique(e[:, 0] * nv + e[:, 1])
+            lines = np.stack([key // nv, key % nv], axis=1).astype(np.int32)
+            ibo = gpu.types.GPUIndexBuf(type="LINES", seq=np.ascontiguousarray(lines))
+            g.wire = (gpu.types.GPUBatch(type="LINES", buf=g.vbo, elem=ibo), len(lines))
+        return g.wire
 
     # ── lifecycle ─────────────────────────────────────────────────────────
     def start(self):
@@ -354,8 +397,7 @@ class Renderer:
         drawn = tris = verts = 0
 
         view_mode = p.view_mode
-        if view_mode == 'VERTEXES':
-            gpu.state.polygon_mode_set('LINE')
+        clay_col = (0.82, 0.55, 0.38, 1.0)          # authored in display space
 
         try:
             for i in np.nonzero(vis)[0]:
@@ -371,7 +413,16 @@ class Renderer:
                 shader.uniform_float("mvp", Matrix((PV @ M).tolist()))
                 shader.uniform_float("normalMat", Matrix(nm.tolist()))
 
-                if view_mode == 'CLUSTERS':
+                if view_mode == 'VERTEXES':
+                    wb, nl = self._wire_batch(g, lvl)
+                    shader.uniform_float("color", (0.05, 0.05, 0.05, 1.0))
+                    shader.uniform_int("useTex", 2)
+                    shader.uniform_sampler("diffuseTex", white)
+                    wb.draw(shader)
+                    tris += lvl.n_tris
+                    drawn += 1
+                    verts += lvl.n_verts
+                elif view_mode == 'CLUSTERS':
                     c_batches = self._cluster_batch(inst.asset, li, g, lvl)
                     for batch, col, nt in c_batches:
                         shader.uniform_float("color", col)
@@ -397,12 +448,13 @@ class Renderer:
                                 batch = b
 
                         if view_mode == 'CLAY':
-                            color = (0.82, 0.55, 0.38, 1.0)
+                            color = clay_col
                             tex = None
                         else:
                             mats = inst.mats
                             color, image = (mats[min(gr.slot, len(mats) - 1)] if mats else DEFAULT_MATERIAL)
                             tex = self._texture(image) if view_mode == 'SHADED' else None
+                            color = _srgb_encode(color)       # material colours are scene-linear
 
                         shader.uniform_float("color", color)
                         shader.uniform_int("useTex", 1 if (tex is not None and view_mode == 'SHADED') else 0)
@@ -413,12 +465,9 @@ class Renderer:
                     if any_drawn:
                         drawn += 1
                         verts += lvl.n_verts
-        finally:
-            if view_mode == 'VERTEXES':
-                gpu.state.polygon_mode_set('FILL')
-
-        gpu.state.depth_mask_set(False)
-        gpu.state.depth_test_set("NONE")
+        finally:                                   # never leak GPU state into Blender's own drawing
+            gpu.state.depth_mask_set(False)
+            gpu.state.depth_test_set("NONE")
         self.stats.update(drawn=drawn, tris=tris, verts=verts,
                           total_tris=sy.status()["source_tris"], limited=limited)
 

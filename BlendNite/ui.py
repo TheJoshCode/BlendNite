@@ -16,6 +16,10 @@ def _on_build_change(self, context):
     state.sync.dirty = True
 
 
+def _on_view_mode(self, context):
+    state.sync.tag_redraw()
+
+
 class BlendNiteProps(bpy.types.PropertyGroup):
     enabled: BoolProperty(
         name="Enable", default=False, update=_on_enabled,
@@ -35,12 +39,13 @@ class BlendNiteProps(bpy.types.PropertyGroup):
     view_mode: EnumProperty(
         name="View Mode",
         items=[
-            ('SHADED', "Shaded", "Standard material and texture shading"),
-            ('CLAY', "Clay", "Uniform clay material shading"),
-            ('CLUSTERS', "Clusters", "Color-coded cluster visualization"),
-            ('VERTEXES', "Vertexes", "Wireframe and vertex view"),
+            ('CLAY', "Clay", "Uniform clay material shading", 'SHADING_SOLID', 0),
+            ('SHADED', "Shaded", "Standard material and texture shading", 'MATERIAL', 1),
+            ('CLUSTERS', "Clusters", "Color-coded cluster visualization", 'OUTLINER_DATA_POINTCLOUD', 2),
+            ('VERTEXES', "Vertexes", "Wireframe and vertex view", 'VERTEXSEL', 3),
         ],
         default='SHADED',
+        update=_on_view_mode,
         description="Viewport rendering mode"
     )
 
@@ -53,8 +58,11 @@ class BLENDNITE_PT_main(bpy.types.Panel):
     bl_category = "BlendNite"
 
     def draw(self, context):
-        p = context.scene.blendnite
         l = self.layout
+        p = getattr(context.scene, "blendnite", None)
+        if p is None:
+            l.label(text="BlendNite is not initialised - restart Blender", icon="ERROR")
+            return
         l.prop(p, "enabled", toggle=True, icon="MESH_DATA")
 
         col = l.column(align=True)
@@ -63,7 +71,10 @@ class BLENDNITE_PT_main(bpy.types.Panel):
         col.prop(p, "max_drawn_verts")
 
         l.separator()
-        row = l.row(align=True)
+        box = l.box()
+        box.label(text="View Mode")
+        row = box.row(align=True)
+        row.scale_y = 1.3
         row.prop(p, "view_mode", expand=True)
         l.separator()
 
