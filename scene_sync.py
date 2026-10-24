@@ -1,16 +1,17 @@
 """
 Scene synchronisation: finds eligible meshes, maps them to shared cluster assets and
-builds missing assets asynchronously.
+builds / patches missing assets on worker threads.
 
-Flow
-  import / duplicate object
-    -> depsgraph handler flags the scene dirty
-    -> timer: content digest of the mesh (cheap: vertex coords + loop indices)
-         * asset in memory?  -> instance created immediately (duplicates land here, no rebuild)
-         * asset on disk?    -> loaded in a worker thread
-         * otherwise         -> triangles extracted on the main thread, built in a worker
-    -> object keeps its native display until its asset is ready, then flips to BOUNDS
-       display so Blender stops drawing the full mesh and our GPU path takes over.
+  duplicate (Alt+D / Shift+D / re-import)
+      -> mesh content digest is identical -> asset already in memory -> instance only
+         carries a matrix, nothing is rebuilt.
+  new geometry
+      -> arrays read on the main thread, clusters + LODs built in a thread pool,
+         cached on disk.  The object keeps native drawing until the asset is ready.
+  vertex edit (edit mode -> object mode)
+      -> topology digest unchanged, positions changed -> only the clusters around the
+         moved vertices are recomputed (clustering.patch_asset).  The previous asset keeps
+         being drawn until the patch lands, so there is no flash of native geometry.
 """
 from __future__ import annotations
 
@@ -26,59 +27,102 @@ import numpy as np
 
 from . import clustering
 
-MARK = "_gpuc_orig_display"
-
-
-def _extract_uvs(mesh) -> np.ndarray:
-    """Return per-vertex UVs from the active UV layer, averaged from loop data.
-    Returns (N, 2) float32 array or None if no UV layer exists."""
-    if not mesh.uv_layers:
-        return None
-    uv_layer = mesh.uv_layers[0].data
-    loops = mesh.loops
-    nv = len(mesh.vertices)
-    uv = np.zeros(nv * 2, np.float32)
-    count = np.zeros(nv, np.float32)
-    for i in range(len(loops)):
-        vi = loops[i].vertex_index
-        uv[vi * 2] += uv_layer[i].uv[0]
-        uv[vi * 2 + 1] += uv_layer[i].uv[1]
-        count[vi] += 1.0
-    ok = count > 0
-    uv[ok] /= count[ok][:, None]
-    return uv.reshape(-1, 2)
+MARK = "_blendnite_orig_display"
+MIN_POLYS = 2000            # smaller meshes are cheaper to leave to Blender
+MAX_LEVELS = 8
+IDLE_EVICT_S = 120.0
+WORKERS = min(4, max(1, (os.cpu_count() or 2) // 2))
+DEFAULT_MATERIAL = ((0.8, 0.8, 0.8, 1.0), None)
 
 
 def default_cache_dir() -> str:
-    return os.path.join(bpy.utils.user_resource("CONFIG", create=True), "gpu_cluster_cache")
+    return os.path.join(bpy.utils.user_resource("CONFIG", create=True), "blendnite_cache")
 
 
 class Settings:
-    __slots__ = ("cluster_size", "lod_levels", "min_polys", "workers",
-                 "hide_native", "cache_dir")
+    __slots__ = ("precision_px", "max_verts", "max_drawn", "cache_dir")
 
     @classmethod
     def from_scene(cls, scene):
-        p = scene.gpu_cluster
+        p = scene.blendnite
         s = cls()
-        s.cluster_size = int(p.cluster_size)
-        s.lod_levels = int(p.lod_levels)
-        s.min_polys = int(p.min_polys)
-        s.workers = int(p.workers)
-        s.hide_native = bool(p.hide_native)
-        s.cache_dir = bpy.path.abspath(p.cache_dir) if p.cache_dir else default_cache_dir()
+        s.precision_px = float(p.precision_px)
+        s.max_verts = int(p.max_cluster_verts)
+        s.max_drawn = int(p.max_drawn_verts)
+        s.cache_dir = default_cache_dir()
         return s
 
     def build_sig(self):
-        return (self.cluster_size, self.lod_levels)
+        return (self.max_verts,)
 
+
+# ── materials (main thread) ───────────────────────────────────────────────
+
+def _find_image(sock, depth=0):
+    if depth > 4 or not sock.is_linked:
+        return None
+    node = sock.links[0].from_node
+    if node.type == "TEX_IMAGE":
+        return node.image
+    for s in node.inputs:
+        if s.is_linked and s.type == "RGBA":
+            img = _find_image(s, depth + 1)
+            if img is not None:
+                return img
+    return None
+
+
+def _color_socket(nt):
+    out = next((n for n in nt.nodes
+                if n.type == "OUTPUT_MATERIAL" and n.is_active_output), None)
+    if out is not None and out.inputs["Surface"].is_linked:
+        n = out.inputs["Surface"].links[0].from_node
+        for name in ("Base Color", "Color"):
+            if name in n.inputs:
+                return n.inputs[name]
+    for n in nt.nodes:
+        if n.type == "BSDF_PRINCIPLED":
+            return n.inputs["Base Color"]
+    return None
+
+
+def material_info(mat):
+    """(rgba, image_name | None) approximating the material for the viewport."""
+    if mat is None:
+        return DEFAULT_MATERIAL
+    color = tuple(float(c) for c in mat.diffuse_color)
+    image = None
+    try:
+        if mat.use_nodes and mat.node_tree:
+            sock = _color_socket(mat.node_tree)
+            if sock is not None:
+                if sock.is_linked:
+                    img = _find_image(sock)
+                    if img is not None:
+                        image = img.name
+                else:
+                    dv = sock.default_value
+                    color = (float(dv[0]), float(dv[1]), float(dv[2]), 1.0)
+    except Exception:
+        pass
+    return (color, image)
+
+
+def _slot_sig(obj):
+    return tuple(s.material.name_full if s.material else None for s in obj.material_slots)
+
+
+# ── instances ─────────────────────────────────────────────────────────────
 
 class Instance:
-    __slots__ = ("name", "key", "asset", "matrix", "center_w", "radius_w", "scale", "cull")
+    __slots__ = ("name", "key", "asset", "matrix", "center_w", "radius_w", "scale",
+                 "flip", "cull", "mats", "mat_sig")
 
     def __init__(self, name, key, asset):
         self.name, self.key, self.asset = name, key, asset
-        self.cull = None            # renderer-owned partial-draw cache
+        self.cull = None
+        self.mats = []
+        self.mat_sig = None
         self.set_matrix(np.eye(4))
 
     def set_matrix(self, mw):
@@ -87,13 +131,68 @@ class Instance:
         self.center_w = m[:3, :3] @ self.asset.center + m[:3, 3]
         self.scale = float(np.linalg.norm(m[:3, :3], axis=0).max())
         self.radius_w = self.asset.radius * self.scale
+        self.flip = bool(np.linalg.det(m[:3, :3]) < 0)
         self.cull = None
+
+
+# ── mesh reading (main thread) ────────────────────────────────────────────
+
+def _get(coll, attr, dtype, count):
+    a = np.empty(count, dtype)
+    coll.foreach_get(attr, a)
+    return a
+
+
+def mesh_digests(mesh):
+    """(topology digest, position digest).  Topology covers connectivity, UVs, face
+    smoothing and material assignment: if it is unchanged an edit is position-only."""
+    nv, nl, npoly = len(mesh.vertices), len(mesh.loops), len(mesh.polygons)
+    ht = hashlib.blake2b(digest_size=12)
+    ht.update(np.array([nv, nl, npoly], np.int64))
+    ht.update(_get(mesh.loops, "vertex_index", np.int32, nl))
+    for attr, dt in (("loop_total", np.int32), ("material_index", np.int32),
+                     ("use_smooth", np.bool_)):
+        try:
+            ht.update(_get(mesh.polygons, attr, dt, npoly))
+        except Exception:
+            pass
+    layer = mesh.uv_layers.active
+    if layer is not None:
+        ht.update(_get(layer.data, "uv", np.float32, nl * 2))
+    hc = hashlib.blake2b(digest_size=12)
+    hc.update(_get(mesh.vertices, "co", np.float32, nv * 3))
+    return ht.hexdigest(), hc.hexdigest()
+
+
+def extract_mesh(mesh):
+    mesh.calc_loop_triangles()
+    nt = len(mesh.loop_triangles)
+    if nt == 0:
+        return None
+    nv, nl = len(mesh.vertices), len(mesh.loops)
+    lt = mesh.loop_triangles
+    try:
+        ts = _get(lt, "use_smooth", np.bool_, nt)
+    except Exception:
+        ts = np.ones(nt, np.bool_)
+    uv = None
+    layer = mesh.uv_layers.active
+    if layer is not None:
+        uv = _get(layer.data, "uv", np.float32, nl * 2).reshape(-1, 2)
+    return {
+        "co": _get(mesh.vertices, "co", np.float32, nv * 3).reshape(-1, 3),
+        "tv": _get(lt, "vertices", np.int32, nt * 3).reshape(-1, 3),
+        "tl": _get(lt, "loops", np.int32, nt * 3).reshape(-1, 3),
+        "tm": _get(lt, "material_index", np.int32, nt),
+        "ts": ts, "uv": uv,
+    }
 
 
 # ── worker jobs (numpy only, never touch bpy) ─────────────────────────────
 
-def _job_build(key, positions, tris, cluster_size, levels, path, uvs):
-    asset = clustering.build_asset(positions, tris, cluster_size, levels, key, uvs)
+def _job_build(key, d, max_verts, path, topo):
+    asset = clustering.build_asset(d["co"], d["tv"], d["tl"], d["tm"], d["ts"], d["uv"],
+                                   max_verts, MAX_LEVELS, key, topo)
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         clustering.save_asset(asset, path)
@@ -104,6 +203,14 @@ def _job_build(key, positions, tris, cluster_size, levels, path, uvs):
 
 def _job_load(key, path):
     return clustering.load_asset(path, key)
+
+
+def _job_patch(old, co, key, topo):
+    return clustering.patch_asset(old, co, key, topo)
+
+
+def _job_prune(folder):
+    clustering.prune_cache(folder)
 
 
 # ── object helpers ────────────────────────────────────────────────────────
@@ -124,47 +231,38 @@ def release_native(obj):
         del obj[MARK]
 
 
-def _digest(mesh) -> str:
-    nv, nl, npoly = len(mesh.vertices), len(mesh.loops), len(mesh.polygons)
-    co = np.empty(nv * 3, np.float32)
-    mesh.vertices.foreach_get("co", co)
-    vi = np.empty(nl, np.int32)
-    mesh.loops.foreach_get("vertex_index", vi)
-    h = hashlib.blake2b(digest_size=12)
-    h.update(co)
-    h.update(vi)
-    try:
-        lt = np.empty(npoly, np.int32)
-        mesh.polygons.foreach_get("loop_total", lt)
-        h.update(lt)
-    except Exception:
-        pass
-    h.update(np.array([nv, nl, npoly], np.int64))
-    return h.hexdigest()
-
-
 class SceneSync:
     def __init__(self):
         self.active = False
+        self.suspended = False       # some 3D view is not in Solid / Material Preview
         self.assets: Dict[str, clustering.ClusterAsset] = {}
         self.instances: Dict[str, Instance] = {}
+        self.obj_key: Dict[str, str] = {}      # object name -> key of its last good asset
         self.futures: Dict[str, object] = {}
+        self.kinds: Dict[str, str] = {}        # key -> "load" | "build" | "patch"
+        self.fb_key: Dict[str, str] = {}       # patch key -> old key still drawn meanwhile
+        self.no_patch = set()
         self.paths: Dict[str, str] = {}
         self.errors: Dict[str, str] = {}
         self.last_used: Dict[str, float] = {}
         self.version = 0     # instance set changed
         self.xver = 0        # some transform changed
+        self.mat_epoch = 0   # material / image data changed
         self.dirty = True
-        self._memo = {}      # mesh session_uid -> (digest, nverts, nloops)
+        self._mat_dirty = False
+        self._memo = {}      # mesh session_uid -> (topo, co, nverts, nloops)
         self._pool = None
         self._pool_workers = 0
         self._last_full = 0.0
         self._last_sig = None
+        self._last_mode = None
+        self._pruned = False
 
     # ── lifecycle ─────────────────────────────────────────────────────────
     def activate(self):
         self.active = True
         self.dirty = True
+        self._pruned = False
         if not bpy.app.timers.is_registered(self._tick):
             bpy.app.timers.register(self._tick, first_interval=0.05, persistent=True)
 
@@ -176,31 +274,18 @@ class SceneSync:
         if self._pool is not None:
             self._pool.shutdown(wait=False, cancel_futures=True)
             self._pool = None
-        self.futures.clear()
-        self.instances.clear()
+        for d in (self.futures, self.kinds, self.fb_key, self.errors, self.instances):
+            d.clear()
+        self.no_patch.clear()
         self.version += 1
 
     def reset_session(self):
         """After file load: uids and object pointers are stale."""
         self._memo.clear()
         self.instances.clear()
+        self.obj_key.clear()
         self.version += 1
         self.dirty = True
-
-    def drop_assets(self, purge_disk_dir=None):
-        self.assets.clear()
-        self.errors.clear()
-        self.instances.clear()
-        self._memo.clear()
-        self.version += 1
-        self.dirty = True
-        if purge_disk_dir and os.path.isdir(purge_disk_dir):
-            for f in os.listdir(purge_disk_dir):
-                if f.endswith(".npz"):
-                    try:
-                        os.remove(os.path.join(purge_disk_dir, f))
-                    except OSError:
-                        pass
 
     @staticmethod
     def restore_all():
@@ -220,11 +305,16 @@ class SceneSync:
                 if u.is_updated_transform and inst is not None:
                     inst.set_matrix(o.matrix_world)
                     moved = True
+                if u.is_updated_geometry and o.data is not None:
+                    self._memo.pop(o.data.session_uid, None)
                 if u.is_updated_geometry or not u.is_updated_transform:
                     self.dirty = True
             elif isinstance(idb, bpy.types.Mesh):
                 if u.is_updated_geometry:
                     self._memo.pop(idb.original.session_uid, None)
+                self.dirty = True
+            elif isinstance(idb, (bpy.types.Material, bpy.types.Image)):
+                self._mat_dirty = True
                 self.dirty = True
             else:
                 self.dirty = True
@@ -232,17 +322,41 @@ class SceneSync:
             self.xver += 1
 
     # ── timer ─────────────────────────────────────────────────────────────
+    @staticmethod
+    def _views_ok() -> bool:
+        wm = bpy.context.window_manager
+        if wm is None:
+            return True
+        for w in wm.windows:
+            for a in w.screen.areas:
+                if a.type == "VIEW_3D":
+                    sp = a.spaces.active
+                    if sp is not None and sp.shading.type not in ("SOLID", "MATERIAL"):
+                        return False
+        return True
+
     def _tick(self):
         try:
             scene = bpy.context.scene
-            if not self.active or scene is None or not hasattr(scene, "gpu_cluster"):
+            if not self.active or scene is None or not hasattr(scene, "blendnite"):
                 return 0.5
-            if not scene.gpu_cluster.enabled:
+            if not scene.blendnite.enabled:
                 return 0.5
             st = Settings.from_scene(scene)
-            sig = st.build_sig()
-            if sig != self._last_sig:
-                self._last_sig = sig
+            if st.build_sig() != self._last_sig:
+                self._last_sig = st.build_sig()
+                self.dirty = True
+            if not self._pruned:
+                self._pruned = True
+                self._get_pool(WORKERS).submit(_job_prune, st.cache_dir)
+            susp = not self._views_ok()
+            if susp != self.suspended:
+                self.suspended = susp
+                self.dirty = True
+            ao = bpy.context.object
+            mode = (ao.name, ao.mode) if ao is not None else None
+            if mode != self._last_mode:           # entering / leaving edit mode
+                self._last_mode = mode
                 self.dirty = True
             finished = self._poll()
             now = time.time()
@@ -250,7 +364,7 @@ class SceneSync:
             if self.dirty or finished or now - self._last_full > 1.0:
                 self.dirty = False
                 self._last_full = now
-                changed |= self.sync(scene, st)
+                changed |= self.sync_scene(scene, st)
             if changed:
                 self.tag_redraw()
             return 0.1
@@ -274,7 +388,7 @@ class SceneSync:
             if self._pool is not None:
                 self._pool.shutdown(wait=False)
             self._pool = ThreadPoolExecutor(max_workers=max(1, workers),
-                                            thread_name_prefix="gpuc")
+                                            thread_name_prefix="blendnite")
             self._pool_workers = workers
         return self._pool
 
@@ -282,96 +396,144 @@ class SceneSync:
         done = [k for k, f in self.futures.items() if f.done()]
         for k in done:
             f = self.futures.pop(k)
+            kind = self.kinds.pop(k, "build")
+            self.fb_key.pop(k, None)
             try:
                 a = f.result()
             except Exception as e:
-                self.errors[k] = repr(e)
+                if kind == "patch":
+                    self.no_patch.add(k)            # fall back to a full build
+                else:
+                    self.errors[k] = repr(e)
+                    traceback.print_exc()
                 continue
-            if a is None:                       # corrupt / outdated disk entry
-                try:
-                    os.remove(self.paths[k])
-                except OSError:
-                    pass
+            if a is None:
+                if kind == "patch":
+                    self.no_patch.add(k)
+                elif kind == "load":                # corrupt / outdated disk entry
+                    try:
+                        os.remove(self.paths[k])
+                    except OSError:
+                        pass
             else:
                 self.assets[k] = a
+        if done:
+            self.dirty = True
         return bool(done)
 
-    def _request(self, key, mesh, st: Settings):
-        if key in self.futures or key in self.errors:
-            return
+    def _request(self, key, obj, mesh, topo, st: Settings):
+        """Make sure `key` is being produced.  Returns an older asset that may be drawn
+        in the meantime (patch case) or None."""
+        if key in self.futures:
+            fb = self.fb_key.get(key)
+            return self.assets.get(fb) if fb else None
+        if key in self.errors:
+            return None
+        pool = self._get_pool(WORKERS)
         path = os.path.join(st.cache_dir, key + ".npz")
         self.paths[key] = path
-        pool = self._get_pool(st.workers)
         if os.path.exists(path):
             self.futures[key] = pool.submit(_job_load, key, path)
-            return
-        mesh.calc_loop_triangles()
-        nt = len(mesh.loop_triangles)
-        if nt == 0:
+            self.kinds[key] = "load"
+            return None
+
+        old_key = self.obj_key.get(obj.name)
+        old = self.assets.get(old_key) if old_key else None
+        if (old is not None and key not in self.no_patch and old.topo == topo
+                and old.max_verts == st.max_verts and old.key != key
+                and len(mesh.vertices) == len(old.src_co)):
+            co = _get(mesh.vertices, "co", np.float32, len(mesh.vertices) * 3).reshape(-1, 3)
+            self.futures[key] = pool.submit(_job_patch, old, co, key, topo)
+            self.kinds[key] = "patch"
+            self.fb_key[key] = old_key
+            return old
+
+        data = extract_mesh(mesh)
+        if data is None:
             self.errors[key] = "no triangles"
-            return
-        co = np.empty(len(mesh.vertices) * 3, np.float32)
-        mesh.vertices.foreach_get("co", co)
-        tris = np.empty(nt * 3, np.int32)
-        mesh.loop_triangles.foreach_get("vertices", tris)
-        uvs = _extract_uvs(mesh)
-        self.futures[key] = pool.submit(_job_build, key, co.reshape(-1, 3),
-                                        tris.reshape(-1, 3), st.cluster_size,
-                                        st.lod_levels, path, uvs)
+            return None
+        self.futures[key] = pool.submit(_job_build, key, data, st.max_verts, path, topo)
+        self.kinds[key] = "build"
+        return None
 
     # ── scene scan ────────────────────────────────────────────────────────
     @staticmethod
-    def _eligible(obj, st: Settings) -> bool:
+    def _eligible(obj) -> bool:
         if obj.type != "MESH" or obj.mode != "OBJECT" or not obj.visible_get():
             return False
         if not (obj.display_type in ("TEXTURED", "SOLID")
                 or (MARK in obj and obj.display_type == "BOUNDS")):
             return False
         mesh = obj.data
-        if mesh is None or len(mesh.polygons) < st.min_polys or mesh.shape_keys:
+        if mesh is None or len(mesh.polygons) < MIN_POLYS or mesh.shape_keys:
             return False
         for m in obj.modifiers:             # evaluated meshes are not clustered
             if m.show_viewport:
                 return False
         return True
 
-    def _key_for(self, mesh, st: Settings) -> str:
+    def _digests_for(self, mesh):
         uid = mesh.session_uid
         sizes = (len(mesh.vertices), len(mesh.loops))
         m = self._memo.get(uid)
-        if m is None or m[1:] != sizes:
-            m = (_digest(mesh),) + sizes
+        if m is None or m[2:] != sizes:
+            m = mesh_digests(mesh) + sizes
             self._memo[uid] = m
-        return f"{m[0]}_{st.cluster_size}_{st.lod_levels}"
+        return m[0], m[1]
 
-    def sync(self, scene, st: Settings) -> bool:
+    def sync_scene(self, scene, st: Settings) -> bool:
         seen = set()
         changed = False
         now = time.time()
+        force_mats = self._mat_dirty
+        if force_mats:
+            self._mat_dirty = False
+            self.mat_epoch += 1
+            changed = True
+        hide = not self.suspended
+
         for obj in scene.objects:
             if obj.type != "MESH":
                 continue
-            if not self._eligible(obj, st):
+            if self.suspended or not self._eligible(obj):
                 release_native(obj)
                 continue
-            key = self._key_for(obj.data, st)
+            mesh = obj.data
+            topo, cohash = self._digests_for(mesh)
+            key = f"v{clustering.FORMAT_VERSION}_{topo}_{cohash}_{st.max_verts}"
             asset = self.assets.get(key)
             if asset is None:
-                self._request(key, obj.data, st)
-                release_native(obj)             # stay native until ready
-                continue
-            self.last_used[key] = now
-            inst = self.instances.get(obj.name)
-            if inst is None or inst.key != key:
-                inst = Instance(obj.name, key, asset)
-                inst.set_matrix(obj.matrix_world)
-                self.instances[obj.name] = inst
-                changed = True
-            seen.add(obj.name)
-            if st.hide_native:
-                _hide_native(obj)
+                fb = self._request(key, obj, mesh, topo, st)
+                if fb is None:
+                    release_native(obj)             # stay native until ready
+                    continue
+                old_key = self.obj_key[obj.name]    # patch pending: keep drawing old asset
+                self.last_used[old_key] = now
+                inst = self.instances.get(obj.name)
+                if inst is None:
+                    inst = Instance(obj.name, old_key, fb)
+                    inst.set_matrix(obj.matrix_world)
+                    self.instances[obj.name] = inst
+                    changed = True
+                asset = fb
             else:
-                release_native(obj)
+                self.last_used[key] = now
+                inst = self.instances.get(obj.name)
+                if inst is None or inst.key != key:
+                    inst = Instance(obj.name, key, asset)
+                    inst.set_matrix(obj.matrix_world)
+                    self.instances[obj.name] = inst
+                    changed = True
+                self.obj_key[obj.name] = key
+            seen.add(obj.name)
+
+            sig = _slot_sig(obj)
+            if force_mats or inst.mat_sig != sig:
+                inst.mat_sig = sig
+                inst.mats = [material_info(s.material) for s in obj.material_slots]
+                changed = True
+            if hide:
+                _hide_native(obj)
 
         gone = [n for n in self.instances if n not in seen]
         for n in gone:
@@ -381,9 +543,9 @@ class SceneSync:
             changed = True
 
         # evict assets nobody has used for a while
-        pending = set(self.futures)
+        pinned = set(self.futures) | set(self.fb_key.values())
         for k in list(self.assets):
-            if k not in pending and now - self.last_used.get(k, now) > 120.0:
+            if k not in pinned and now - self.last_used.get(k, now) > IDLE_EVICT_S:
                 del self.assets[k]
                 self.last_used.pop(k, None)
         return changed
@@ -392,8 +554,9 @@ class SceneSync:
         tris = sum(i.asset.tri_count for i in self.instances.values())
         return {
             "instances": len(self.instances),
-            "assets": len(self.assets),
+            "assets": len({i.key for i in self.instances.values()}),
             "pending": len(self.futures),
+            "patching": sum(1 for k in self.kinds.values() if k == "patch"),
             "errors": len(self.errors),
             "source_tris": tris,
         }
