@@ -267,23 +267,40 @@ def extract_mesh(mesh):
 
 # ── worker jobs (numpy only, never touch bpy) ─────────────────────────────
 
-def _job_build(key, d, max_verts, path, topo):
+def _job_build(key, d, max_verts, path, topo, progress=None):
+    if progress is not None:
+        progress(0.02, "Preparing mesh data")
     asset = clustering.build_asset(d["co"], d["tv"], d["tl"], d["tm"], d["ts"], d["uv"],
-                                   max_verts, MAX_LEVELS, key, topo)
+                                   max_verts, MAX_LEVELS, key, topo,
+                                   progress=progress)
+    if progress is not None:
+        progress(0.96, "Writing cache")
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         clustering.save_asset(asset, path)
     except OSError:
         pass
+    if progress is not None:
+        progress(1.0, "Build complete")
     return asset
 
 
-def _job_load(key, path):
-    return clustering.load_asset(path, key)
+def _job_load(key, path, progress=None):
+    if progress is not None:
+        progress(0.05, "Opening cached asset")
+    asset = clustering.load_asset(path, key)
+    if progress is not None:
+        progress(0.95, "Loading cached asset")
+    return asset
 
 
-def _job_patch(old, co, key, topo):
-    return clustering.patch_asset(old, co, key, topo)
+def _job_patch(old, co, key, topo, progress=None):
+    if progress is not None:
+        progress(0.08, "Checking edited mesh changes")
+    asset = clustering.patch_asset(old, co, key, topo)
+    if progress is not None:
+        progress(0.90, "Updating LOD levels")
+    return asset
 
 
 def _job_prune(folder):
@@ -337,6 +354,10 @@ class SceneSync:
         self._last_mode = None
         self._pruned = False
         self._tick_cb = self._tick           # one stable bound-method object for bpy.app.timers
+        self._build_keys = set()
+        self._build_completed = set()
+        self._build_progress = {}
+        self._build_stage = {}
 
     # ── lifecycle ─────────────────────────────────────────────────────────
     def activate(self):
@@ -359,6 +380,10 @@ class SceneSync:
         for d in (self.futures, self.kinds, self.fb_key, self.errors, self.instances):
             d.clear()
         self.no_patch.clear()
+        self._build_keys.clear()
+        self._build_completed.clear()
+        self._build_progress.clear()
+        self._build_stage.clear()
         self.version += 1
 
     def reset_session(self):
@@ -366,6 +391,8 @@ class SceneSync:
         self._memo.clear()
         self.instances.clear()
         self.obj_key.clear()
+        self._build_keys.clear()
+        self._build_completed.clear()
         self.version += 1
         self.dirty = True
 
@@ -484,12 +511,31 @@ class SceneSync:
             self._pool_workers = workers
         return self._pool
 
+    def _track_asset_job(self, key):
+        if (key not in self._build_keys
+                and self._build_keys
+                and self._build_completed == self._build_keys):
+            self._build_keys.clear()
+            self._build_completed.clear()
+            self._build_progress.clear()
+            self._build_stage.clear()
+        self._build_keys.add(key)
+
+    def _set_build_progress(self, key, fraction, stage=""):
+        self._build_progress[key] = max(
+            self._build_progress.get(key, 0.0), min(1.0, float(fraction)))
+        if stage:
+            self._build_stage[key] = stage
+
     def _poll(self) -> bool:
         done = [k for k, f in self.futures.items() if f.done()]
         for k in done:
             f = self.futures.pop(k)
             kind = self.kinds.pop(k, "build")
             self.fb_key.pop(k, None)
+            if kind in ("build", "load", "patch") and k in self._build_keys:
+                self._build_completed.add(k)
+                self._build_progress[k] = 1.0
             try:
                 a = f.result()
             except Exception as e:
@@ -529,8 +575,10 @@ class SceneSync:
         path = os.path.join(st.cache_dir, key + ".npz")
         self.paths[key] = path
         if os.path.exists(path):
-            self.futures[key] = pool.submit(_job_load, key, path)
+            progress = lambda fraction, stage="", key=key: self._set_build_progress(key, fraction, stage)
+            self.futures[key] = pool.submit(_job_load, key, path, progress)
             self.kinds[key] = "load"
+            self._track_asset_job(key)
             bn_debug.debug("Assets", f"Loading cached asset {key[:12]} for '{obj.name}'")
             return None
 
@@ -540,9 +588,11 @@ class SceneSync:
                 and old.max_verts == st.max_verts and old.key != key
                 and len(mesh.vertices) == len(old.src_co)):
             co = _get(mesh.vertices, "co", np.float32, len(mesh.vertices) * 3).reshape(-1, 3)
-            self.futures[key] = pool.submit(_job_patch, old, co, key, topo)
+            progress = lambda fraction, stage="", key=key: self._set_build_progress(key, fraction, stage)
+            self.futures[key] = pool.submit(_job_patch, old, co, key, topo, progress)
             self.kinds[key] = "patch"
             self.fb_key[key] = old_key
+            self._track_asset_job(key)
             bn_debug.debug("Assets", f"Patching edited mesh '{obj.name}' from asset {old_key[:12]}")
             return old
 
@@ -551,8 +601,10 @@ class SceneSync:
             self.errors[key] = "no triangles"
             bn_debug.warn("Assets", f"Mesh '{obj.name}' has no usable triangles")
             return None
-        self.futures[key] = pool.submit(_job_build, key, data, st.max_verts, path, topo)
+        progress = lambda fraction, stage="", key=key: self._set_build_progress(key, fraction, stage)
+        self.futures[key] = pool.submit(_job_build, key, data, st.max_verts, path, topo, progress)
         self.kinds[key] = "build"
+        self._track_asset_job(key)
         bn_debug.info("Assets", f"Building asset for '{obj.name}' "
                       f"({len(mesh.vertices):,} vertices, {len(mesh.polygons):,} polygons, "
                       f"skeletal={skelet.is_skeletal_mesh(obj)})")
@@ -667,6 +719,16 @@ class SceneSync:
 
     def status(self) -> dict:
         tris = sum(i.asset.tri_count for i in self.instances.values())
+        total_builds = len(self._build_keys)
+        completed_builds = len(self._build_completed.intersection(self._build_keys))
+        build_progress = (sum(self._build_progress.get(k, 0.0) for k in self._build_keys)
+                          / total_builds if total_builds else 0.0)
+        active_stage = ""
+        for key in self._build_keys:
+            if key not in self._build_completed:
+                active_stage = self._build_stage.get(key, "")
+                if active_stage:
+                    break
         return {
             "instances": len(self.instances),
             "assets": len({i.key for i in self.instances.values()}),
@@ -674,4 +736,8 @@ class SceneSync:
             "patching": sum(1 for k in self.kinds.values() if k == "patch"),
             "errors": len(self.errors),
             "source_tris": tris,
+            "build_total": total_builds,
+            "build_completed": completed_builds,
+            "build_progress": build_progress,
+            "build_stage": active_stage,
         }

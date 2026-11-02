@@ -316,7 +316,7 @@ def _coarse_level(p2, u2, t2, tri_mat0, ti, vmap, ck, max_verts, cell):
 
 # ── build ─────────────────────────────────────────────────────────────────
 
-def build_asset(co, tv, tl, tm, ts, uv, max_verts=128, max_levels=8, key="", topo=""):
+def build_asset(co, tv, tl, tm, ts, uv, max_verts=128, max_levels=8, key="", topo="", progress=None):
     """co (Ns,3) source positions; tv/tl (T,3) per-triangle source vertex / loop
     indices; tm (T,) material slot; ts (T,) smooth flag; uv (loops,2) or None."""
     co = np.ascontiguousarray(co, np.float32).reshape(-1, 3)
@@ -330,7 +330,11 @@ def build_asset(co, tv, tl, tm, ts, uv, max_verts=128, max_levels=8, key="", top
         uv = np.ascontiguousarray(uv, np.float32).reshape(-1, 2)
     max_verts = int(max(12, max_verts))
 
+    if progress is not None:
+        progress(0.10, "Welding mesh vertices")
     src, uv0, tris0 = weld_corners(co, tv, tl, ts, uv)
+    if progress is not None:
+        progress(0.18, "Building LOD 0")
     pos0 = co[src]
     bmin, bmax = pos0.min(axis=0), pos0.max(axis=0)
     extent = max(float((bmax - bmin).max()), 1e-9)
@@ -341,14 +345,19 @@ def build_asset(co, tv, tl, tm, ts, uv, max_verts=128, max_levels=8, key="", top
     lvl0 = _make_level(pos0, uv0, tris0, tm, ts, weld=src, src=src,
                        vmap=np.zeros(0, np.int32), cell_keys=np.zeros(0, np.int64),
                        max_verts=max_verts, error=0.0, cell=0.0)
+    if progress is not None:
+        progress(0.24, "LOD 0 complete")
     levels = [lvl0]
     prev_T = lvl0.n_tris
     res = max(8.0, math.sqrt(prev_T / 2.0))
-    for _ in range(1, max_levels):
+    for level_index in range(1, max_levels):
         res *= 0.5
         if res < 3.0 or prev_T <= max_verts:
             break
         cell = extent / res
+        if progress is not None:
+            progress(0.24 + 0.64 * (level_index / max(1, max_levels - 1)),
+                     f"Building LOD {level_index}")
         r = simplify_grid(pos0, uv0, lvl0.tris, origin, cell)
         if r is None:
             break
@@ -357,6 +366,8 @@ def build_asset(co, tv, tl, tm, ts, uv, max_verts=128, max_levels=8, key="", top
             continue
         levels.append(_coarse_level(p2, u2, t2, lvl0.tri_mat, ti, vmap, ck, max_verts, cell))
         prev_T = len(t2)
+    if progress is not None:
+        progress(0.92, "Finalizing LOD levels")
     return ClusterAsset(key, levels, center, radius, max_verts, co.copy(), origin, topo)
 
 

@@ -104,7 +104,18 @@ class BLENDNITE_PT_main(bpy.types.Panel):
         box.label(text=f"Objects {st['instances']}  |  Unique assets {st['assets']}")
         if st["pending"]:
             what = "Updating edit" if st["patching"] else "Building"
-            box.label(text=f"{what}: {st['pending']} ...", icon="SORTTIME")
+            total = max(st["build_total"], st["pending"])
+            completed = min(st["build_completed"], total)
+            progress = st["build_progress"]
+            percent = int(progress * 100)
+            stage = st.get("build_stage", "")
+            text = f"{what}: {percent}%"
+            if stage:
+                text = f"{text} - {stage}"
+            try:
+                box.progress(text=text, factor=progress)
+            except (AttributeError, TypeError):
+                box.label(text=f"{text} ({int(progress * 100)}%)", icon="SORTTIME")
         if st["errors"]:
             box.label(text=f"Failed: {st['errors']} (see console)", icon="ERROR")
         if rs["total_tris"]:

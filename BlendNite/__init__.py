@@ -58,7 +58,7 @@ def _safe_unregister_class(c):
 
 
 def register():
-    bn_debug.info("Addon", f"Registering BlendNite {'.'.join(str(v) for v in bl_info['version'])}")
+    bn_debug.info("Addon", "Registering BlendNite 1.0.1")
     # clean leftovers from a failed / replaced earlier registration (e.g. re-install
     # without restarting Blender) so register_class never sees a half-state
     for c in reversed(ui.CLASSES):
