@@ -20,12 +20,14 @@ import os
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict
+from typing import Dict, Optional
 
 import bpy
 import numpy as np
 
 from . import clustering
+from . import material_sampler as msampler
+from . import skeletal_cluster as skelet
 
 MARK = "_blendnite_orig_display"
 MAX_LEVELS = 8
@@ -93,26 +95,55 @@ def _color_socket(nt):
     return None
 
 
+# ── Universal material info (any texture type supported) ────────────────────────
+
 def material_info(mat):
-    """(rgba, image_name | None) approximating the material for the viewport."""
+    """(rgba, image_name | None | "procedural") approximating the material for the viewport.
+
+    Detects image textures, procedural textures (noise, gradient, voronoi, wave),
+    and classifies materials so renderer.py can pick the correct draw path.
+    Returns ("image") when an image is found, ("procedural") when only procedural
+    texture nodes exist, and None for solid-colour materials (backward compatible).
+    """
     if mat is None:
         return DEFAULT_MATERIAL
-    color = tuple(float(c) for c in mat.diffuse_color)
-    image = None
+
+    color = tuple(float(c) for c in mat.diffuse_color[:3]) + (1.0,)
+    
     try:
-        if mat.node_tree:                       # Material.use_nodes is deprecated (5.0) / always True
+        if mat.node_tree:
             sock = _color_socket(mat.node_tree)
             if sock is not None:
                 if sock.is_linked:
-                    img = _find_image(sock)
-                    if img is not None:
-                        image = img.name
+                    # Check material type — image vs procedural vs mixed
+                    mat_type = msampler.material_type(mat)
+                    if mat_type == "image":
+                        img = _find_image(sock)
+                        if img is not None:
+                            return (color, img.name)       # existing image-texture path
+                    elif mat_type in ("procedural", "mixed"):
+                        return (color, "procedural")      # trigger procedural sampling
                 else:
                     dv = sock.default_value
                     color = (float(dv[0]), float(dv[1]), float(dv[2]), 1.0)
     except Exception:
         pass
-    return (color, image)
+
+    # Fallback to the simplified solid colour
+    return (color, None)
+
+
+def material_texture_name(mat) -> Optional[str]:
+    """Return the texture identifier for renderer dispatch."""
+    if mat is None:
+        return None
+    try:
+        if mat.node_tree and msampler.material_has_any_texture(mat):
+            mt = msampler.material_type(mat)
+            return mt  # "image" | "procedural" | "mixed"
+    except Exception:
+        pass
+    return None
 
 
 def _slot_sig(obj):
@@ -123,13 +154,14 @@ def _slot_sig(obj):
 
 class Instance:
     __slots__ = ("name", "key", "asset", "matrix", "center_w", "radius_w", "scale",
-                 "flip", "cull", "mats", "mat_sig")
+                 "flip", "cull", "mats", "mat_sig", "skeletal")
 
     def __init__(self, name, key, asset):
         self.name, self.key, self.asset = name, key, asset
         self.cull = None
         self.mats = []
         self.mat_sig = None
+        self.skeletal = False
         self.set_matrix(np.eye(4))
 
     def set_matrix(self, mw):
@@ -510,10 +542,13 @@ class SceneSync:
                 or (MARK in obj and obj.display_type == "BOUNDS")):
             return False
         mesh = obj.data
-        if mesh is None or len(mesh.vertices) < min_verts or len(mesh.polygons) == 0 or mesh.shape_keys:
+        skeletal = skelet.is_skeletal_mesh(obj)
+        if mesh is None or len(mesh.vertices) < min_verts or len(mesh.polygons) == 0:
+            return False
+        if mesh.shape_keys and not skeletal:
             return False
         for m in obj.modifiers:             # evaluated meshes are not clustered
-            if m.show_viewport:
+            if m.show_viewport and not (m.type == "ARMATURE" and skeletal):
                 return False
         return True
 
@@ -558,8 +593,11 @@ class SceneSync:
                 if inst is None:
                     inst = Instance(obj.name, old_key, fb)
                     inst.set_matrix(obj.matrix_world)
+                    inst.skeletal = skelet.is_skeletal_mesh(obj)
                     self.instances[obj.name] = inst
                     changed = True
+                else:
+                    inst.skeletal = skelet.is_skeletal_mesh(obj)
                 asset = fb
             else:
                 self.last_used[key] = now
@@ -569,6 +607,7 @@ class SceneSync:
                     inst.set_matrix(obj.matrix_world)
                     self.instances[obj.name] = inst
                     changed = True
+                inst.skeletal = skelet.is_skeletal_mesh(obj)
                 self.obj_key[obj.name] = key
             seen.add(obj.name)
 

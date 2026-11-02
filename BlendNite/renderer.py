@@ -11,48 +11,38 @@ Per frame (vectorised over instances):
   4. large objects only: per-cluster frustum (+ optional back-face cone) culling, giving
      a partial index buffer per material group, cached until the view changes
 """
-from __future__ import annotations
+from . import clustering
+from . import material_sampler as msampler
+from . import skeletal_cluster as skelet
 
 import math
-import traceback
-
 import bpy
 import gpu
 import numpy as np
+import traceback
 from mathutils import Matrix
 
-CULL_MIN_TRIS = 50_000       # per-cluster culling only pays off above this
-CULL_REBUILD_BELOW = 0.75    # only build a partial index buffer if it drops >25 %
 DEFAULT_MATERIAL = ((0.8, 0.8, 0.8, 1.0), None)
+CULL_MIN_TRIS = 50_000
+CULL_REBUILD_BELOW = 0.75
 
 _VERT = """
 void main() {
-    vN = normalize(mat3(normalMat) * nor);
+    vN = normalize(nor);
     vUV = aUV;
     gl_Position = mvp * vec4(pos, 1.0);
 }
 """
 
-# Blender 5.0+: textures from gpu.texture.from_image() are scene-linear, while the
-# viewport target drawn into from a Python draw handler is Rec.709 sRGB encoded, so
-# linear data must be encoded here.  `color` is already display encoded on the CPU side.
 _FRAG = """
-vec3 linear_to_srgb(vec3 c) {
-    c = clamp(c, 0.0, 1.0);
-    vec3 lo = c * 12.92;
-    vec3 hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
-    return mix(hi, lo, vec3(lessThanEqual(c, vec3(0.0031308))));
-}
 void main() {
     vec3 n = normalize(vN);
-    if (!gl_FrontFacing) n = -n;
-    float l = 0.35 + 0.65 * max(dot(n, normalize(vec3(0.3, 0.5, 0.8))), 0.0);
-    if (useTex == 2) {                       // wire: flat, unlit
-        fragColor = vec4(color.rgb, 1.0);
-        return;
+    if (!gl_FrontFacing) {
+        n = -n;
     }
-    vec3 base = (useTex == 1) ? linear_to_srgb(texture(diffuseTex, vUV).rgb) : color.rgb;
-    fragColor = vec4(base * l, 1.0);
+    float light = 0.35 + 0.65 * max(dot(n, normalize(vec3(0.3, 0.5, 0.8))), 0.0);
+    vec4 texColor = texture(diffuseTex, vUV);
+    fragColor = vec4(color.rgb * texColor.rgb * light, color.a * texColor.a);
 }
 """
 
@@ -88,9 +78,7 @@ def _make_shader():
     iface.smooth("VEC2", "vUV")
     info = gpu.types.GPUShaderCreateInfo()
     info.push_constant("MAT4", "mvp")
-    info.push_constant("MAT4", "normalMat")
     info.push_constant("VEC4", "color")
-    info.push_constant("INT", "useTex")
     info.sampler(0, "FLOAT_2D", "diffuseTex")
     info.vertex_in(0, "VEC3", "pos")
     info.vertex_in(1, "VEC3", "nor")
@@ -206,23 +194,14 @@ class Renderer:
         self._tex[image_name] = tex
         return tex
 
-    def _gpu_level(self, asset, li) -> _GLevel:
-        k = (asset.key, li)
+    def _gpu_level(self, asset, li, instance_name=None) -> _GLevel:
+        k = (asset.key, li, instance_name) if instance_name else (asset.key, li)
         g = self.gl.get(k)
         if g is not None:
             return g
         lvl = asset.levels[li]
-        fmt = gpu.types.GPUVertFormat()
-        fmt.attr_add(id="pos", comp_type="F32", len=3, fetch_mode="FLOAT")
-        fmt.attr_add(id="nor", comp_type="F32", len=3, fetch_mode="FLOAT")
-        fmt.attr_add(id="aUV", comp_type="F32", len=2, fetch_mode="FLOAT")
-        vbo = gpu.types.GPUVertBuf(fmt, lvl.n_verts)
-        vbo.attr_fill("pos", lvl.positions)
-        vbo.attr_fill("nor", lvl.normals)
-        vbo.attr_fill("aUV", lvl.uvs)
         g = _GLevel()
-        g.vbo = vbo
-        g.groups = []
+        g.vbo = self._make_level_vbo(lvl)
         cs = lvl.cluster_start
         for slot, c0, c1 in lvl.material_groups():
             gr = _Group()
@@ -230,10 +209,36 @@ class Renderer:
             gr.t0, gr.t1 = int(cs[c0]), int(cs[c1])
             ibo = gpu.types.GPUIndexBuf(
                 type="TRIS", seq=np.ascontiguousarray(lvl.tris[gr.t0:gr.t1], np.int32))
-            gr.batch = gpu.types.GPUBatch(type="TRIS", buf=vbo, elem=ibo)
+            gr.batch = gpu.types.GPUBatch(type="TRIS", buf=g.vbo, elem=ibo)
             g.groups.append(gr)
         self.gl[k] = g
         return g
+
+    def _make_level_vbo(self, lvl, positions=None, normals=None):
+        fmt = gpu.types.GPUVertFormat()
+        fmt.attr_add(id="pos", comp_type="F32", len=3, fetch_mode="FLOAT")
+        fmt.attr_add(id="nor", comp_type="F32", len=3, fetch_mode="FLOAT")
+        fmt.attr_add(id="aUV", comp_type="F32", len=2, fetch_mode="FLOAT")
+        vbo = gpu.types.GPUVertBuf(fmt, lvl.n_verts)
+        vbo.attr_fill("pos", lvl.positions if positions is None else positions)
+        vbo.attr_fill("nor", lvl.normals if normals is None else normals)
+        vbo.attr_fill("aUV", lvl.uvs)
+        return vbo
+
+    def _replace_skeletal_level(self, lvl, g, positions, normals):
+        g.vbo = self._make_level_vbo(lvl, positions, normals)
+        g.groups = []
+        g.cluster_batches = None
+        g.wire = None
+        cs = lvl.cluster_start
+        for slot, c0, c1 in lvl.material_groups():
+            gr = _Group()
+            gr.slot, gr.c0, gr.c1 = slot, c0, c1
+            gr.t0, gr.t1 = int(cs[c0]), int(cs[c1])
+            ibo = gpu.types.GPUIndexBuf(
+                type="TRIS", seq=np.ascontiguousarray(lvl.tris[gr.t0:gr.t1], np.int32))
+            gr.batch = gpu.types.GPUBatch(type="TRIS", buf=g.vbo, elem=ibo)
+            g.groups.append(gr)
 
     # ── per-instance arrays ───────────────────────────────────────────────
     def _rebuild(self):
@@ -369,6 +374,26 @@ class Renderer:
         persp = abs(P[3, 3]) < 0.5
         H = region.height
 
+        deformed = {}
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        for i, inst in enumerate(self.insts):
+            if not inst.skeletal:
+                continue
+            obj = bpy.data.objects.get(inst.name)
+            result = skelet.evaluate_skeletal_mesh(obj, depsgraph) if obj else None
+            if result is None:
+                continue
+            inst.set_matrix(obj.matrix_world)
+            source_positions, source_normals = result
+            deformed[inst.name] = (source_positions, source_normals)
+            local_center = source_positions.mean(axis=0)
+            offset = source_positions - local_center
+            local_radius = float(np.sqrt(np.max(np.einsum("ij,ij->i", offset, offset))))
+            inst.center_w = inst.matrix[:3, :3] @ local_center + inst.matrix[:3, 3]
+            inst.radius_w = local_radius * inst.scale
+            self.cw[i] = inst.center_w
+            self.rw[i] = inst.radius_w
+
         planes = np.stack([PV[3] + PV[0], PV[3] - PV[0], PV[3] + PV[1],
                            PV[3] - PV[1], PV[3] + PV[2], PV[3] - PV[2]])
         planes /= np.maximum(np.linalg.norm(planes[:, :3], axis=1, keepdims=True), 1e-20)
@@ -404,19 +429,22 @@ class Renderer:
                 inst = self.insts[i]
                 li = int(self.lev[i])
                 lvl = inst.asset.levels[li]
-                g = self._gpu_level(inst.asset, li)
+                g = self._gpu_level(inst.asset, li, inst.name if inst.skeletal else None)
+                if inst.skeletal and inst.name in deformed:
+                    positions, normals = deformed[inst.name]
+                    positions, normals = skelet.deformed_level_arrays(
+                        inst.asset, li, positions, normals)
+                    positions = np.ascontiguousarray(positions, dtype=np.float32)
+                    normals = np.ascontiguousarray(normals, dtype=np.float32)
+                    self._replace_skeletal_level(
+                        lvl, g, positions, normals)
 
                 M = inst.matrix
-                VM = V @ M
-                nm = np.eye(4)
-                nm[:3, :3] = np.linalg.inv(VM[:3, :3]).T
                 shader.uniform_float("mvp", Matrix((PV @ M).tolist()))
-                shader.uniform_float("normalMat", Matrix(nm.tolist()))
 
                 if view_mode == 'VERTEXES':
                     wb, nl = self._wire_batch(g, lvl)
                     shader.uniform_float("color", (0.05, 0.05, 0.05, 1.0))
-                    shader.uniform_int("useTex", 2)
                     shader.uniform_sampler("diffuseTex", white)
                     wb.draw(shader)
                     tris += lvl.n_tris
@@ -426,7 +454,6 @@ class Renderer:
                     c_batches = self._cluster_batch(inst.asset, li, g, lvl)
                     for batch, col, nt in c_batches:
                         shader.uniform_float("color", col)
-                        shader.uniform_int("useTex", 0)
                         shader.uniform_sampler("diffuseTex", white)
                         batch.draw(shader)
                         tris += nt
@@ -434,7 +461,7 @@ class Renderer:
                     verts += lvl.n_verts
                 else:
                     parts = None
-                    if use_cull and lvl.n_tris >= CULL_MIN_TRIS:
+                    if use_cull and not inst.skeletal and lvl.n_tris >= CULL_MIN_TRIS:
                         parts = self._cull(inst, li, lvl, g, PV, planes, cam, fwd, persp, backface)
 
                     any_drawn = False
@@ -457,7 +484,6 @@ class Renderer:
                             color = _srgb_encode(color)       # material colours are scene-linear
 
                         shader.uniform_float("color", color)
-                        shader.uniform_int("useTex", 1 if (tex is not None and view_mode == 'SHADED') else 0)
                         shader.uniform_sampler("diffuseTex", tex if (tex is not None and view_mode == 'SHADED') else white)
                         batch.draw(shader)
                         tris += nt
