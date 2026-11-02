@@ -28,6 +28,7 @@ import numpy as np
 from . import clustering
 from . import material_sampler as msampler
 from . import skeletal_cluster as skelet
+from . import debug as bn_debug
 
 MARK = "_blendnite_orig_display"
 MAX_LEVELS = 8
@@ -294,8 +295,9 @@ def _job_prune(folder):
 def _hide_native(obj):
     if MARK not in obj:
         obj[MARK] = obj.display_type
-    if obj.display_type != "BOUNDS":
-        obj.display_type = "BOUNDS"
+    if obj.display_type != "WIRE":
+        obj.display_type = "WIRE"
+        bn_debug.debug("SceneSync", f"Object '{obj.name}': native mesh switched to WIRE")
 
 
 def release_native(obj):
@@ -305,6 +307,7 @@ def release_native(obj):
         except TypeError:
             obj.display_type = "TEXTURED"
         del obj[MARK]
+        bn_debug.debug("SceneSync", f"Object '{obj.name}': native display restored")
 
 
 class SceneSync:
@@ -340,11 +343,13 @@ class SceneSync:
         self.active = True
         self.dirty = True
         self._pruned = False
+        bn_debug.info("SceneSync", "BlendNite viewport synchronization activated")
         if not bpy.app.timers.is_registered(self._tick_cb):
             bpy.app.timers.register(self._tick_cb, first_interval=0.05, persistent=True)
 
     def deactivate(self):
         self.active = False
+        bn_debug.info("SceneSync", "BlendNite viewport synchronization deactivated")
         if bpy.app.timers.is_registered(self._tick_cb):
             bpy.app.timers.unregister(self._tick_cb)
         self.restore_all()
@@ -423,6 +428,10 @@ class SceneSync:
             if st.build_sig() != self._last_sig:
                 self._last_sig = st.build_sig()
                 self.dirty = True
+                bn_debug.info(
+                    "Settings",
+                    f"Build settings changed: max_cluster_verts={st.max_verts}, "
+                    f"max_drawn_verts={st.max_drawn}")
             if not self._pruned:
                 self._pruned = True
                 self._get_pool(WORKERS).submit(_job_prune, st.cache_dir)
@@ -430,11 +439,17 @@ class SceneSync:
             if susp != self.suspended:
                 self.suspended = susp
                 self.dirty = True
+                bn_debug.info("SceneSync", "Viewport synchronization suspended" if susp
+                              else "Viewport synchronization resumed")
             ao = bpy.context.object
             mode = (ao.name, ao.mode) if ao is not None else None
             if mode != self._last_mode:           # entering / leaving edit mode
                 self._last_mode = mode
                 self.dirty = True
+                if mode is None:
+                    bn_debug.debug("SceneSync", "No active object")
+                else:
+                    bn_debug.info("SceneSync", f"Object '{mode[0]}' mode changed to {mode[1]}")
             finished = self._poll()
             now = time.time()
             changed = finished
@@ -480,9 +495,11 @@ class SceneSync:
             except Exception as e:
                 if kind == "patch":
                     self.no_patch.add(k)            # fall back to a full build
+                    bn_debug.warn("Assets", f"Incremental patch failed for {k[:12]}; full rebuild fallback")
                 else:
                     self.errors[k] = repr(e)
                     traceback.print_exc()
+                    bn_debug.warn("Assets", f"{kind.capitalize()} failed for {k[:12]}: {e}")
                 continue
             if a is None:
                 if kind == "patch":
@@ -494,6 +511,8 @@ class SceneSync:
                         pass
             else:
                 self.assets[k] = a
+                bn_debug.info("Assets", f"{kind.capitalize()} completed: {k[:12]} "
+                              f"{len(a.levels)} LODs, {a.tri_count:,} source triangles")
         if done:
             self.dirty = True
         return bool(done)
@@ -512,6 +531,7 @@ class SceneSync:
         if os.path.exists(path):
             self.futures[key] = pool.submit(_job_load, key, path)
             self.kinds[key] = "load"
+            bn_debug.debug("Assets", f"Loading cached asset {key[:12]} for '{obj.name}'")
             return None
 
         old_key = self.obj_key.get(obj.name)
@@ -523,23 +543,29 @@ class SceneSync:
             self.futures[key] = pool.submit(_job_patch, old, co, key, topo)
             self.kinds[key] = "patch"
             self.fb_key[key] = old_key
+            bn_debug.debug("Assets", f"Patching edited mesh '{obj.name}' from asset {old_key[:12]}")
             return old
 
         data = extract_mesh(mesh)
         if data is None:
             self.errors[key] = "no triangles"
+            bn_debug.warn("Assets", f"Mesh '{obj.name}' has no usable triangles")
             return None
         self.futures[key] = pool.submit(_job_build, key, data, st.max_verts, path, topo)
         self.kinds[key] = "build"
+        bn_debug.info("Assets", f"Building asset for '{obj.name}' "
+                      f"({len(mesh.vertices):,} vertices, {len(mesh.polygons):,} polygons, "
+                      f"skeletal={skelet.is_skeletal_mesh(obj)})")
         return None
 
     # ── scene scan ────────────────────────────────────────────────────────
     @staticmethod
     def _eligible(obj, min_verts) -> bool:
-        if obj.type != "MESH" or obj.mode != "OBJECT" or not obj.visible_get():
+        if obj.type != "MESH" or obj.mode != "OBJECT":
             return False
-        if not (obj.display_type in ("TEXTURED", "SOLID")
-                or (MARK in obj and obj.display_type == "BOUNDS")):
+        if not obj.visible_get() and MARK not in obj:
+            return False
+        if obj.display_type not in ("TEXTURED", "SOLID", "WIRE"):
             return False
         mesh = obj.data
         skeletal = skelet.is_skeletal_mesh(obj)
@@ -596,6 +622,8 @@ class SceneSync:
                     inst.skeletal = skelet.is_skeletal_mesh(obj)
                     self.instances[obj.name] = inst
                     changed = True
+                    bn_debug.info("Instances", f"Registered instance '{obj.name}' "
+                                  f"skeletal={inst.skeletal}, patch fallback={True}")
                 else:
                     inst.skeletal = skelet.is_skeletal_mesh(obj)
                 asset = fb
@@ -607,6 +635,8 @@ class SceneSync:
                     inst.set_matrix(obj.matrix_world)
                     self.instances[obj.name] = inst
                     changed = True
+                    bn_debug.info("Instances", f"Registered instance '{obj.name}' "
+                                  f"skeletal={skelet.is_skeletal_mesh(obj)}")
                 inst.skeletal = skelet.is_skeletal_mesh(obj)
                 self.obj_key[obj.name] = key
             seen.add(obj.name)
@@ -622,6 +652,7 @@ class SceneSync:
         gone = [n for n in self.instances if n not in seen]
         for n in gone:
             del self.instances[n]
+            bn_debug.info("Instances", f"Unregistered instance '{n}'")
         if gone or changed:
             self.version += 1
             changed = True

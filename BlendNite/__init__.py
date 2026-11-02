@@ -22,6 +22,7 @@ import bpy
 from bpy.app.handlers import persistent
 
 from . import state, ui
+from . import debug as bn_debug
 
 
 @persistent
@@ -57,6 +58,7 @@ def _safe_unregister_class(c):
 
 
 def register():
+    bn_debug.info("Addon", f"Registering BlendNite {'.'.join(str(v) for v in bl_info['version'])}")
     # clean leftovers from a failed / replaced earlier registration (e.g. re-install
     # without restarting Blender) so register_class never sees a half-state
     for c in reversed(ui.CLASSES):

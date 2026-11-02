@@ -14,6 +14,7 @@ Per frame (vectorised over instances):
 from . import clustering
 from . import material_sampler as msampler
 from . import skeletal_cluster as skelet
+from . import debug as bn_debug
 
 import math
 import bpy
@@ -95,13 +96,16 @@ class _Group:
 
 
 class _GLevel:
-    __slots__ = ("vbo", "groups", "cluster_batches", "wire")
+    __slots__ = ("vbo", "groups", "cluster_batches", "wire",
+                 "deformed_positions", "deformed_normals")
 
     def __init__(self):
         self.vbo = None
         self.groups = []
         self.cluster_batches = None
         self.wire = None
+        self.deformed_positions = None
+        self.deformed_normals = None
 
 
 class Renderer:
@@ -119,6 +123,8 @@ class Renderer:
         self._last_err = None
         self.insts = []
         self.lev = np.zeros(0, np.int64)
+        self._skeletal_source_cache = {}
+        self._skeletal_level_cache = {}
 
 
     # ── cluster / wire debug batches (built lazily) ───────────────────────
@@ -155,11 +161,13 @@ class Renderer:
         if self.handle is None:
             self.handle = bpy.types.SpaceView3D.draw_handler_add(
                 self.draw, (), "WINDOW", "POST_VIEW")
+            bn_debug.info("Renderer", "Viewport draw handler started")
 
     def stop(self):
         if self.handle is not None:
             bpy.types.SpaceView3D.draw_handler_remove(self.handle, "WINDOW")
             self.handle = None
+            bn_debug.info("Renderer", "Viewport draw handler stopped")
         self.gl.clear()
         self._tex.clear()
         self.shader = None
@@ -171,6 +179,7 @@ class Renderer:
     def _get_shader(self):
         if self.shader is None:
             self.shader = _make_shader()
+            bn_debug.info("Renderer", "GPU shader compiled")
         return self.shader
 
     def _white(self):
@@ -226,10 +235,22 @@ class Renderer:
         return vbo
 
     def _replace_skeletal_level(self, lvl, g, positions, normals):
+        if (g.deformed_positions is not None
+                and g.deformed_normals is not None
+                and np.array_equal(g.deformed_positions, positions)
+                and np.array_equal(g.deformed_normals, normals)):
+            return
+        bn_debug.debug_throttled(
+            "Skeletal", id(g), 
+            f"Rebuilt deformed GPU buffer: {lvl.n_verts:,} vertices, "
+            f"{lvl.n_tris:,} triangles, {len(g.groups):,} groups",
+            0.25)
         g.vbo = self._make_level_vbo(lvl, positions, normals)
         g.groups = []
         g.cluster_batches = None
         g.wire = None
+        g.deformed_positions = positions.copy()
+        g.deformed_normals = normals.copy()
         cs = lvl.cluster_start
         for slot, c0, c1 in lvl.material_groups():
             gr = _Group()
@@ -380,12 +401,30 @@ class Renderer:
             if not inst.skeletal:
                 continue
             obj = bpy.data.objects.get(inst.name)
-            result = skelet.evaluate_skeletal_mesh(obj, depsgraph) if obj else None
-            if result is None:
-                continue
+            signature = skelet.skeletal_signature(obj) if obj else b""
+            cached = self._skeletal_source_cache.get(inst.name)
+            if (cached is not None and cached[2] == signature):
+                source_positions, source_normals = cached[0], cached[1]
+                deformed[inst.name] = (source_positions, source_normals)
+                bn_debug.debug_throttled(
+                    "Skeletal", f"pose-cache-{inst.name}", 
+                    f"Pose cache reused for '{inst.name}'", 2.0)
+            else:
+                result = skelet.evaluate_skeletal_mesh(obj, depsgraph) if obj else None
+                if result is None:
+                    bn_debug.warn("Skeletal", f"Failed to evaluate deformed mesh '{inst.name}'")
+                    continue
+                source_positions, source_normals = result
+                source_positions = np.ascontiguousarray(source_positions, dtype=np.float32)
+                source_normals = np.ascontiguousarray(source_normals, dtype=np.float32)
+                deformed[inst.name] = (source_positions, source_normals)
+                self._skeletal_source_cache[inst.name] = (
+                    source_positions.copy(), source_normals.copy(), signature)
+                cached = (source_positions, source_normals, signature)
+                bn_debug.debug(
+                    "Skeletal", f"Evaluated deformed mesh '{inst.name}': "
+                    f"{len(source_positions):,} vertices")
             inst.set_matrix(obj.matrix_world)
-            source_positions, source_normals = result
-            deformed[inst.name] = (source_positions, source_normals)
             local_center = source_positions.mean(axis=0)
             offset = source_positions - local_center
             local_radius = float(np.sqrt(np.max(np.einsum("ij,ij->i", offset, offset))))
@@ -432,10 +471,21 @@ class Renderer:
                 g = self._gpu_level(inst.asset, li, inst.name if inst.skeletal else None)
                 if inst.skeletal and inst.name in deformed:
                     positions, normals = deformed[inst.name]
-                    positions, normals = skelet.deformed_level_arrays(
-                        inst.asset, li, positions, normals)
-                    positions = np.ascontiguousarray(positions, dtype=np.float32)
-                    normals = np.ascontiguousarray(normals, dtype=np.float32)
+                    cache_key = (inst.name, inst.asset.key, li)
+                    cached_level = self._skeletal_level_cache.get(cache_key)
+                    if (cached_level is not None
+                            and np.array_equal(cached_level[0], positions)
+                            and np.array_equal(cached_level[1], normals)):
+                        positions, normals = cached_level[2], cached_level[3]
+                    else:
+                        positions, normals = skelet.deformed_level_arrays(
+                            inst.asset, li, positions, normals)
+                        positions = np.ascontiguousarray(positions, dtype=np.float32)
+                        normals = np.ascontiguousarray(normals, dtype=np.float32)
+                        self._skeletal_level_cache[cache_key] = (
+                            deformed[inst.name][0].copy(),
+                            deformed[inst.name][1].copy(),
+                            positions, normals)
                     self._replace_skeletal_level(
                         lvl, g, positions, normals)
 
@@ -500,5 +550,11 @@ class Renderer:
         self._frame += 1
         if self._frame % 240 == 0:          # free GPU buffers of evicted assets
             live = {i.key for i in self.insts}
+            removed = 0
             for k in [k for k in self.gl if k[0] not in live]:
                 del self.gl[k]
+                removed += 1
+            bn_debug.info(
+                "Renderer",
+                f"Frame cache summary: {drawn} objects, {tris:,}/{self.stats['total_tris']:,} triangles, "
+                f"{verts:,} vertices, {len(self.gl)} GPU levels, {removed} evicted")

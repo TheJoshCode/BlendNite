@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import bpy
 import numpy as np
+from . import debug as bn_debug
 
 
 def is_skeletal_mesh(obj: bpy.types.Object) -> bool:
@@ -18,9 +19,33 @@ def is_skeletal_mesh(obj: bpy.types.Object) -> bool:
     )
 
 
+def skeletal_signature(obj: bpy.types.Object) -> bytes:
+    """Return a compact signature for armature and shape-key pose state."""
+    if obj is None:
+        return b""
+
+    values = []
+    values.append(np.asarray(obj.matrix_world, dtype=np.float64).tobytes())
+    for modifier in obj.modifiers:
+        if modifier.type == "ARMATURE" and modifier.show_viewport and modifier.object is not None:
+            armature = modifier.object
+            values.append(np.asarray(armature.matrix_world, dtype=np.float64).tobytes())
+            if armature.pose is not None:
+                for bone in armature.pose.bones:
+                    values.append(np.asarray(bone.matrix, dtype=np.float64).tobytes())
+                    values.append(np.asarray(bone.matrix_basis, dtype=np.float64).tobytes())
+    if obj.data is not None and getattr(obj.data, "shape_keys", None) is not None:
+        for key_block in obj.data.shape_keys.key_blocks:
+            values.append(np.asarray(key_block.value, dtype=np.float64).tobytes())
+            values.append(np.asarray(key_block.data[0].co if len(key_block.data) else (0.0, 0.0, 0.0),
+                                      dtype=np.float64).tobytes())
+    return b"".join(values)
+
+
 def evaluate_skeletal_mesh(obj: bpy.types.Object, depsgraph):
     """Return current evaluated object-space positions and normals."""
     if not is_skeletal_mesh(obj) or depsgraph is None:
+        bn_debug.warn("Skeletal", f"Cannot evaluate '{getattr(obj, 'name', '<none>')}': no skeletal viewport modifier or depsgraph")
         return None
 
     evaluated = obj.evaluated_get(depsgraph)
@@ -113,20 +138,37 @@ def deformed_level_arrays(asset, level_index, evaluated_positions, evaluated_nor
     base_normals = evaluated_normals[base_source_indices]
     positions = np.empty((level.n_verts, 3), dtype=np.float32)
     normals = np.empty((level.n_verts, 3), dtype=np.float32)
+    positions[:] = level.positions
+    normals[:] = level.normals
 
-    for vertex_index in range(level.n_verts):
-        base_indices = np.flatnonzero(source_map == vertex_index)
-        if len(base_indices) == 0:
-            positions[vertex_index] = level.positions[vertex_index]
-            normals[vertex_index] = level.normals[vertex_index]
-            continue
+    valid = (
+        (source_map >= 0)
+        & (source_map < level.n_verts)
+        & (base_source_indices >= 0)
+        & (base_source_indices < len(evaluated_positions))
+    )
+    if not np.any(valid):
+        return positions, normals
 
-        positions[vertex_index] = base_positions[base_indices].mean(axis=0)
-        normal = base_normals[base_indices].mean(axis=0)
-        normal_length = float(np.linalg.norm(normal))
-        if normal_length > 1e-6:
-            normals[vertex_index] = normal / normal_length
-        else:
-            normals[vertex_index] = level.normals[vertex_index]
+    targets = source_map[valid]
+    counts = np.bincount(targets, minlength=level.n_verts).astype(np.float32)
+    used = counts > 0
+    position_sums = np.zeros((level.n_verts, 3), dtype=np.float32)
+    normal_sums = np.zeros((level.n_verts, 3), dtype=np.float32)
+    np.add.at(position_sums, targets, base_positions[valid])
+    np.add.at(normal_sums, targets, base_normals[valid])
+    positions[used] = position_sums[used] / counts[used, None]
+
+    normal_lengths = np.linalg.norm(normal_sums[used], axis=1)
+    normalized = np.zeros((int(np.count_nonzero(used)), 3), dtype=np.float32)
+    np.divide(
+        normal_sums[used],
+        normal_lengths[:, None],
+        out=normalized,
+        where=normal_lengths[:, None] > 1e-6,
+    )
+    target_indices = np.flatnonzero(used)
+    good = normal_lengths > 1e-6
+    normals[target_indices[good]] = normalized[good]
 
     return positions, normals

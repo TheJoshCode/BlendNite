@@ -2,6 +2,7 @@ import bpy
 from bpy.props import BoolProperty, FloatProperty, IntProperty, EnumProperty
 
 from . import state
+from . import debug as bn_debug
 
 
 def _on_enabled(self, context):
@@ -20,10 +21,19 @@ def _on_view_mode(self, context):
     state.sync.tag_redraw()
 
 
+def _on_debug_logging(self, context):
+    bn_debug.set_enabled(self.debug_logging)
+
+
 class BlendNiteProps(bpy.types.PropertyGroup):
     enabled: BoolProperty(
         name="Enable", default=False, update=_on_enabled,
         description="Draw eligible meshes through the BlendNite clustered GPU path")
+    debug_logging: BoolProperty(
+        name="Debug Logging", default=True,
+        description="Print BlendNite lifecycle, cache, skeletal, LOD, and rendering diagnostics "
+                    "to the Blender console",
+        update=_on_debug_logging)
     precision_px: FloatProperty(
         name="Precision (px)", default=10.0, min=0.5, max=64.0, step=50, precision=1,
         description="Maximum on-screen geometric error in pixels. Lower = more detail, "
@@ -74,6 +84,7 @@ class BLENDNITE_PT_main(bpy.types.Panel):
         col.prop(p, "min_verts")
         col.prop(p, "max_cluster_verts")
         col.prop(p, "max_drawn_verts")
+        col.prop(p, "debug_logging", toggle=True)
 
         l.separator()
         box = l.box()
